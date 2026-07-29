@@ -1,0 +1,42 @@
+# MikeMeetings on the 242 box.
+#  - mikeos-meetings: the app (Express + WS signaling) on the shared deploy_default
+#    network so Caddy can reach it and it can reach the calendar (mikeos-events:8000).
+#  - mikeos-meetings-turn: self-hosted coturn (STUN + TURN) via host networking so the
+#    UDP relay ports work without docker NAT. Zero Google, zero paid services.
+services:
+  mikeos-meetings:
+    build: .
+    image: mikeos-meetings:latest
+    container_name: mikeos-meetings
+    restart: unless-stopped
+    environment:
+      PORT: 8095
+      ISSUER: https://account.osmike.com
+      CLIENT_ID: meetings-web
+      CALENDAR_URL: http://mikeos-events:8000
+      TURN_HOST: meetings.osmike.com
+      TURN_PORT: "3478"
+      TURN_SECRET: ${TURN_SECRET}
+      TURN_REALM: meetings.osmike.com
+      COOKIE_SECRET: ${COOKIE_SECRET}
+    networks: [deploy_default]
+    mem_limit: 512m
+    cpus: 1.0
+
+  mikeos-meetings-turn:
+    image: coturn/coturn:latest
+    container_name: mikeos-meetings-turn
+    restart: unless-stopped
+    network_mode: host
+    command: >
+      -n --use-auth-secret --static-auth-secret=${TURN_SECRET}
+      --realm=meetings.osmike.com --server-name=meetings.osmike.com
+      --listening-port=3478 --min-port=49160 --max-port=49200
+      --external-ip=91.98.177.242 --no-tls --no-dtls --no-cli
+      --fingerprint --stale-nonce --no-multicast-peers
+      --user-quota=12 --total-quota=1200 --simple-log --log-file=stdout
+    mem_limit: 256m
+
+networks:
+  deploy_default:
+    external: true

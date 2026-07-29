@@ -1,0 +1,14 @@
+{
+  "name": "mikeos-meetings",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "MikeMeetings — meetings.osmike.com: WebRTC video meetings + MikeOS calendar integration",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cookie-parser": "^1.4.6",
+    "ws": "^8.17.0"
+  }
+}

@@ -85,10 +85,11 @@ async function boot(){
 
 // ===================== HOME =====================
 function header(){
+  // Top-right account display is now the shared MikeOS bar (switcher.js).
+  // The avatar/name/Sign-out chip moved there; only the DISPLAY moved — the
+  // /auth/login + logout() logic is unchanged and still used below/elsewhere.
   return `<header class="bar"><div class="logo">◎</div><div class="brand">Mike<span class="dot">Meetings</span></div><div class="spacer"></div>
-    ${me.authenticated?`<div class="chip"><div class="av">${initials(me.user?.name||me.user?.email)}</div><div class="nm">${esc(me.user?.name||'MikeOS user')}</div>
-      <button class="btn ghost" style="height:30px;padding:0 12px" onclick="logout()">Sign out</button></div>`
-    :`<button class="btn primary" onclick="location.href='/auth/login'">🔑 Sign in</button>`}</header>`;
+    <div data-mikeos-switcher></div></header>`;
 }
 window.logout=async()=>{await fetch('/auth/logout',{method:'POST'});location.href='/';};
 
@@ -218,5 +219,6 @@ async function renderRoom(roomId){
 
 boot();
 </script>
+<script src="https://apps.osmike.com/switcher.js" defer></script>
 </body>
 </html>

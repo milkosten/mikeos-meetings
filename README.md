@@ -47,6 +47,32 @@ meeting links to it (and to its CRM customer).
 - Load test: `scripts/load_sfu.py` (same flags as `load_mesh.py`, plus `--tcp K` = TURN over TCP only).
 - Follow-up: TURN over TLS on 443 for strict corporate firewalls (needs Caddy layer4 or a second IP on 114).
 
+## Screen sharing (2026-11-25, SFU rooms)
+- **Share** button in the call bar (everyone, guests too). Chrome/Edge open the picker on *This tab / Window / Entire
+  screen* with tabs first (`displaySurface:'browser'`), offer the tab's sound, never offer the meeting tab itself
+  (`selfBrowserSurface:'exclude'`), allow switching what is shared (`surfaceSwitching:'include'`), no system audio.
+  Firefox/Safari: window or screen, no sound. Browsers without `getDisplayMedia` (phones, tablets): the button is dimmed
+  and a tap explains why; they can still watch. Mesh rooms: "Sharing needs the standard meeting mode" (no mesh sharing).
+- Published as LiveKit `ScreenShare` (+ `ScreenShareAudio` for tab sound), name `screen:<browser|window|monitor>`; the
+  camera keeps running. One full-size VP8 layer: text = `contentHint 'detail'`, 15 fps, ≤2.5 Mbit/s,
+  keep-resolution; the sharer's **Smooth video** tick = `'motion'`, 30 fps, ≤4 Mbit/s, keep-frame-rate (changed live,
+  remembered per browser). No spatial simulcast for the share: measured live, an extra 360p layer stalled Chrome's
+  bandwidth estimate at 0.5–0.9 Mbit/s and viewers got 427x239 for 45 s+; one layer gave 1280x716 @15 fps within 5 s.
+- Viewers: the share takes the stage, people become a filmstrip (right side on desktop, a row at the bottom ≤640 px),
+  pill "Name is sharing a tab/a window/their screen", two or more shares get a switcher (newest first on stage; hidden
+  ones are paused by the SFU). Pinch / ctrl+wheel zoom, drag while zoomed, double tap resets; full-screen button (locks
+  landscape where allowed, iPhone uses the video's own full screen). The sharer gets a "You're sharing" bar with a small
+  preview, Smooth video and Stop, and never sees its own share full size. The browser's own *Stop sharing* ends it in
+  the meeting too (track `ended`).
+- **Host stop**: the host sees *Stop this share* on someone else's share → `/ws {type:'stop-share', target}` → the
+  server checks host (signed in, `host_sub`), SFU room, target in the meeting, tells the sharer (`share-stopped`, they
+  get a notice) and mutes exactly their `SCREEN_SHARE`/`SCREEN_SHARE_AUDIO` tracks in LiveKit (`GetParticipant` →
+  `MutePublishedTrack`), answer `stop-share-result`. Everyone else gets `only_the_host_can_stop_shares`. Logged.
+- Recording: unchanged. Tab/system audio is never recorded or transcribed: each browser records only its microphone
+  publication; the share's audio is a separate LiveKit track that is only played to the others.
+- Tests: `test/share.test.js` (offline); live `scripts/live_share_e2e.py` (3 Chromes; `--site` + `--guests` for a staging
+  server), load `scripts/load_share.py` (one sharer + N viewers, CPU/bitrate).
+
 ## Link formats
 - `https://meetings.osmike.com/r/<room>` — join (guests type a name)
 - `https://meetings.osmike.com/m/<meeting>` — notes of one past meeting (participants only)
@@ -54,6 +80,7 @@ meeting links to it (and to its CRM customer).
 
 ## Tests
 - Offline: `docker build -t mikeos-meetings:test . && docker run --rm mikeos-meetings:test node --test test/`
+- Live sharing: `python3 scripts/live_share_e2e.py` (see Screen sharing).
 - Live: `python3 scripts/live_e2e.py` (two headless Chromes with espeak WAVs as microphones; meshtest4 host + a guest,
   meshtest5 must get 404; screenshots into docs/screens; deletes its meeting). `scripts/live_gpu.mjs` checks STT + Qwen.
 - Agents: `osmike-meetings past|notes ID|transcript ID` (osmike-cli) → osmike-runs `/v1/runs/meetings/past` →

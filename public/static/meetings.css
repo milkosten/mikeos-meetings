@@ -37,7 +37,7 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 .recnote { display:flex; gap:4px; align-items:flex-start; border:1px solid var(--site-rec); border-radius:12px; padding:12px 14px; margin:8px 0 16px; }
 .recnote .ic { color:var(--site-rec); margin-top:4px; }
 .join h1 { overflow-wrap:anywhere; }
-.toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:10px 18px; border-radius:999px; font-size:15px; z-index:60; max-width:calc(100vw - 32px); }
+.toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:10px 18px; border-radius:18px; text-align:center; font-size:15px; z-index:60; max-width:calc(100vw - 32px); }
 
 /* The call: a dark stage in both themes (video reads best on dark). */
 #app { flex:1; display:flex; flex-direction:column; min-height:0; }
@@ -86,3 +86,42 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 .tile.camoff::after { content:""; position:absolute; inset:0; margin:auto; width:28%; aspect-ratio:1; border-radius:50%; background:var(--site-stage-line); }
 .tile .lkaudio { display:none; }
 .soundbtn { position:absolute; left:50%; top:64px; transform:translateX(-50%); z-index:10; }
+
+/* Screen sharing (SFU): a share takes the stage, the people become a filmstrip (side on desktop, bottom on phones). */
+.room [hidden] { display:none !important; }
+.ctl.share .ic { width:24px; height:24px; margin:0; }
+.ctl.share.on { background:var(--site-ok); }
+.ctl.share.unavail { opacity:.45; }
+.body { flex:1; min-height:0; display:flex; flex-direction:column; }
+.sharebar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:6px 12px; background:var(--site-stage2); border-bottom:2px solid var(--site-ok); font-size:15px; }
+.sharebar video { width:96px; aspect-ratio:16/9; height:auto; border-radius:6px; background:var(--site-tile); object-fit:contain; flex:none; }
+.sharebar .sb-t { font-weight:700; flex:1; min-width:120px; }
+.sharebar .smooth { display:inline-flex; align-items:center; gap:6px; font-size:14px; color:var(--site-stage-muted); cursor:pointer; min-height:36px; }
+.sharebar .smooth input { width:18px; height:18px; accent-color:var(--site-ok); margin:0; }
+.btn.sbstop { background:var(--site-rec); color:var(--site-stage-ink); border:0; min-height:36px; padding:6px 18px; font-size:15px; }
+.screens { flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; gap:8px; padding:10px 0 10px 14px; }
+.sh-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+.sh-tabs { display:flex; gap:6px; flex-wrap:wrap; }
+.sh-tab { border:1px solid var(--site-stage-line); background:transparent; color:var(--site-stage-ink); border-radius:999px; padding:4px 12px; font:600 14px var(--sans); cursor:pointer; min-height:34px; }
+.sh-tab[aria-selected="true"] { background:var(--site-stage-ink); color:var(--site-stage); border-color:var(--site-stage-ink); }
+.sh-pill { font-size:14px; color:var(--site-stage-ink); border:1px solid var(--site-ok); border-radius:999px; padding:3px 12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+.sh-stop, .sh-full { min-height:34px; padding:4px 12px; font-size:14px; }
+.sh-full .ic { margin:0; }
+.sh-view { flex:1; min-height:0; position:relative; background:var(--site-tile); border-radius:12px; overflow:hidden; touch-action:none; }
+.sh-item { position:absolute; inset:0; }
+.sh-item video { width:100%; height:100%; object-fit:contain; display:block; transform-origin:center; background:var(--site-tile); }
+.sh-item.zoomed { cursor:grab; }
+.screens:fullscreen { padding:8px; background:var(--site-stage); }
+.room.sharing .body { flex-direction:row; }
+.room.sharing .stage { flex:0 0 232px; flex-direction:column; flex-wrap:nowrap; align-content:stretch; justify-content:flex-start; overflow-y:auto; padding:10px 14px 10px 10px; }
+.room.sharing .tile { width:100%; flex:0 0 auto; }
+.room.sharing .tile.self { position:relative; right:auto; bottom:auto; border:0; z-index:auto; }
+@media (max-width:640px) {
+  .room.sharing .body { flex-direction:column; }
+  .screens { padding:8px 8px 0; }
+  .room.sharing .stage { flex:0 0 auto; flex-direction:row; overflow-x:auto; overflow-y:hidden; padding:8px; gap:8px; }
+  .room.sharing .tile { width:128px; }
+  .sharebar video { width:64px; }
+  .sharebar .sb-t { min-width:0; font-size:14px; }
+  .controls { gap:10px; }
+}

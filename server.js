@@ -205,15 +205,31 @@ export function createApp(env = process.env, deps = {}) {
     return jwt({ iss: cfg.LIVEKIT_API_KEY, sub: identity, name, nbf: now - 10, exp: now + ttl, jti: identity + '-' + rid(6),
       video: { room, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: false, canUpdateOwnMetadata: false } });
   }
-  async function lkAdmin(method, body) {     // best effort: the /ws socket stays the authority on who is in the meeting
+  async function lkCall(method, body) {      // best effort: the /ws socket stays the authority on who is in the meeting
     if (!cfg.SFU_READY) return null;
     const now = Math.floor(Date.now() / 1000);
     const tok = jwt({ iss: cfg.LIVEKIT_API_KEY, sub: 'meetings-server', nbf: now - 10, exp: now + 60, video: { room: body.room, roomAdmin: true, roomCreate: true } });
     try {
       const r = await fetchImpl(`${cfg.LIVEKIT_HTTP}/twirp/livekit.RoomService/${method}`, { method: 'POST',
         headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
-      return r.status;
+      let json = null; try { json = await r.json(); } catch { /* no body */ }
+      if (!r.ok) log('livekit', method, r.status, json?.msg || '');
+      return { status: r.status, ok: r.ok, json };
     } catch (e) { log('livekit', method, e.message); return null; }
+  }
+  const lkAdmin = async (method, body) => (await lkCall(method, body))?.status ?? null;
+  // Screen sharing: the host can stop someone else's share. The SFU stops forwarding it at once (MutePublishedTrack on
+  // that person's screen-share video + tab audio, found with GetParticipant) and their browser is told to stop sharing.
+  const SCREEN_SOURCES = new Set(['SCREEN_SHARE', 'SCREEN_SHARE_AUDIO', 3, 4]);
+  async function muteScreens(room, identity) {
+    const p = await lkCall('GetParticipant', { room, identity });
+    let n = 0;
+    for (const t of (p?.json?.tracks || [])) {
+      if (!SCREEN_SOURCES.has(t.source) || t.muted) continue;
+      const r = await lkCall('MutePublishedTrack', { room, identity, track_sid: t.sid, muted: true });
+      if (r?.ok) n++;
+    }
+    return n;
   }
   const sfuInfo = (live, ws) => ({ url: cfg.LIVEKIT_URL, token: lkToken(live.meetingId, ws.peerId, ws.name) });
 
@@ -488,6 +504,8 @@ export function createApp(env = process.env, deps = {}) {
           else send(ws, { type: 'error', error: 'only_the_host_can_end' });
           return;
         }
+        if (msg.type === 'share') return shareState(ws, msg);
+        if (msg.type === 'stop-share') return stopShare(ws, msg).catch((e) => log('stop-share', e.message));
         if (msg.type === 'leave') { leave(ws); ws.roomId = null; }
       });
       ws.on('close', () => leave(ws, true));
@@ -547,6 +565,32 @@ export function createApp(env = process.env, deps = {}) {
     for (const [, o] of live.peers) send(o, { type: 'peer-joined', id: ws.peerId, name });
     live.peers.set(ws.peerId, ws);
     log('meeting', m.id, 'joined', ws.peerId, name, ws.user ? 'signed in' : 'guest', live.media);
+  }
+
+  // ---------- screen sharing (SFU rooms; everyone may share, guests too). The picture and tab audio go through LiveKit
+  // only: they are never recorded or transcribed (each browser records only its own microphone, as before).
+  const SHARE_KINDS = ['browser', 'window', 'monitor'];
+  function shareState(ws, msg) {         // the browser says it started/stopped sharing: for the log and for the host's Stop
+    const live = liveRooms.get(ws.roomId);
+    if (!live || live.peers.get(ws.peerId) !== ws) return;
+    const kind = msg.on ? (SHARE_KINDS.includes(msg.kind) ? msg.kind : 'screen') : null;
+    if (kind !== (ws.sharing || null)) log('meeting', live.meetingId, kind ? `share started (${kind}${msg.audio ? ' + tab audio' : ''})` : `share stopped${msg.why ? ` (${String(msg.why).slice(0, 40)})` : ''}`, ws.peerId, ws.name);
+    ws.sharing = kind;
+  }
+  async function stopShare(ws, msg) {
+    const live = liveRooms.get(ws.roomId), m = live && store.meeting(live.meetingId);
+    if (!m || live.peers.get(ws.peerId) !== ws) return;
+    const target = String(msg.target || '');
+    const reply = (o) => send(ws, { type: 'stop-share-result', target, ...o });
+    if (!(ws.user && m.host_sub === ws.user.sub)) return reply({ ok: false, error: 'only_the_host_can_stop_shares' });
+    if (live.media !== 'sfu') return reply({ ok: false, error: 'not_sfu' });
+    const t = live.peers.get(target);
+    if (!t || target === ws.peerId) return reply({ ok: false, error: 'not_in_meeting' });
+    send(t, { type: 'share-stopped', by: ws.name });          // their browser stops the capture and unpublishes
+    const muted = await muteScreens(live.meetingId, target);  // and the SFU stops forwarding it right away
+    log('meeting', live.meetingId, 'share of', target, t.name, 'stopped by the host', ws.name, `(${muted} track${muted === 1 ? '' : 's'} muted in the SFU)`);
+    t.sharing = null;
+    reply({ ok: true, muted, name: t.name });
   }
 
   function recStart(ws, msg) {

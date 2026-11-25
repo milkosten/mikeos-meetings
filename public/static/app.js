@@ -32,6 +32,8 @@
 <symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.3"/><path d="M3 19.5c.6-3.4 3-5 6-5s5.4 1.6 6 5"/><circle cx="17" cy="9.5" r="2.6"/><path d="M16.5 14.6c2.3.2 4 1.6 4.5 4.4"/></symbol>
 <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
 <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 9.5h17M8 3v4M16 3v4"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4M12 13.5V8M9.3 10.5L12 7.8l2.7 2.7"/></symbol>
+<symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
 <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
 </defs></svg>`;
   const icon = (id) => `<svg class="ic" aria-hidden="true"><use href="#i-${id}"/></svg>`;
@@ -247,20 +249,35 @@
         <span class="rec" id="recst" role="status" title="This meeting is recorded and transcribed">${icon('rec')}<span class="rt">Rec</span></span>
         <span class="cnt" id="cnt">connecting…</span><span class="grow"></span>
         <button class="btn ghostdark" id="copy" type="button">${icon('link')}<span class="hide-s">Copy link</span></button></div>
-      <div class="stage" id="grid"></div>
+      <div class="sharebar" id="sharebar" role="status" hidden><video id="sharepv" muted playsinline autoplay aria-hidden="true"></video>
+        <span class="sb-t">You're sharing <span id="sbkind">your screen</span></span>
+        <label class="smooth" title="For video and animation. Off = sharpest text."><input type="checkbox" id="smooth"> Smooth video</label>
+        <button class="btn sbstop" id="sbstop" type="button">Stop</button></div>
+      <div class="body" id="body">
+        <section class="screens" id="screens" hidden aria-label="Shared screen">
+          <div class="sh-head"><div class="sh-tabs" id="shtabs" role="tablist" aria-label="Shares"></div><span class="sh-pill" id="shpill"></span>
+            <span class="grow"></span><button class="btn ghostdark sh-stop" id="shstop" type="button" hidden>Stop this share</button>
+            <button class="btn ghostdark sh-full" id="shfull" type="button" title="Full screen" aria-label="Full screen">${icon('full')}</button></div>
+          <div class="sh-view" id="shview"></div><div id="shaudio" hidden></div>
+        </section>
+        <div class="stage" id="grid"></div>
+      </div>
       <div class="waiting" id="waiting" hidden>Waiting for others… share the link to invite someone.<br><button class="btn ghostdark" id="copy2" type="button">Copy link</button></div>
       <div class="controls">
         <button class="ctl" id="mic" type="button" aria-pressed="false" title="Mute">🎙️</button>
         <button class="ctl" id="cam" type="button" aria-pressed="false" title="Camera">🎥</button>
+        <button class="ctl share" id="share" type="button" aria-pressed="false" title="Share a tab, window or screen">${icon('share')}<span class="sr-only">Share screen</span></button>
         <button class="ctl leave" id="leave" type="button">Leave</button>
         <button class="ctl leave end" id="endall" type="button" hidden>End for all</button>
       </div></div>`;
     const copy = () => { navigator.clipboard?.writeText(location.origin + '/r/' + roomId); showToast('Link copied'); };
     $('#copy').onclick = copy; $('#copy2').onclick = copy;
-    let localStream, iceServers = [], ws, meetingId = null, ended = false, mode = 'mesh', lkRoom = null;
+    let localStream, iceServers = [], ws, meetingId = null, ended = false, mode = 'mesh', lkRoom = null, isHost = false;
     const pcs = new Map();
     const grid = $('#grid'), cnt = $('#cnt');
     const myName = me.authenticated ? me.user.name : guestName;
+    // Screen sharing (SFU only). SH.me = my own share; SH.screens = the others' shares (identity -> entry); SH.sel = the one on the stage.
+    const SH = { me: null, screens: new Map(), sel: null, starting: false };
 
     function tile(id, name, muted) {
       let t = grid.querySelector(`[data-p="${id}"]`);
@@ -275,6 +292,10 @@
     const updCnt = () => { cnt.textContent = (others() + 1) + ' in call'; layout(); };
     function layout() {
       const self = grid.querySelector('.tile.self'), others = [...grid.querySelectorAll('.tile:not(.self)')], wait = $('#waiting');
+      if ($('.room') && $('.room').classList.contains('sharing')) {     // a share on the stage: the people are a filmstrip
+        grid.querySelectorAll('.tile').forEach((t) => { t.style.width = ''; t.classList.remove('pip', 'solo'); });
+        if (wait) wait.hidden = true; return;
+      }
       if (self) { self.classList.toggle('solo', !others.length); self.classList.toggle('pip', others.length > 0); }
       if (wait) { wait.hidden = others.length > 0 || ended; if (!others.length && self) wait.style.top = (grid.offsetTop + grid.offsetHeight / 2 + self.offsetHeight / 2 + 14) + 'px'; }
       if (!others.length) return;
@@ -510,7 +531,10 @@
     window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg, mode: () => mode, room: () => lkRoom, stats: () => sfuStats(), dropSocket: () => ws && ws.close(),   // diagnostics + load tests
       rec: () => ({ state: R.state, why: R.why, seg: R.seg, restarts: R.restarts, queued: R.out.length, lastChunkAgo: Date.now() - R.lastChunk, track: R.track && R.track.id, recorder: R.rec && R.rec.state, log: R.log.slice(-15) }),
       endMic: () => { const t = micTrack(); if (t) { t.stop(); t.dispatchEvent(new Event('ended')); } return !!t; },   // a microphone that goes away
-      swapMic: () => reacquireMic('test swap').then((t) => !!t),                                                        // a switch of device
+      swapMic: () => reacquireMic('test swap').then((t) => !!t),
+      share: () => ({ me: SH.me ? { kind: SH.me.kind, audio: !!SH.me.a, smooth: SH.me.smooth } : null, screens: [...SH.screens.values()].map((x) => ({ id: x.id, name: x.name, kind: x.kind })), sel: SH.sel,
+        layout: $('.room') ? $('.room').classList.contains('sharing') : false, pill: ($('#shpill') || {}).textContent || '', bar: $('#sharebar') ? !$('#sharebar').hidden : false }),
+      endShare: () => { if (!SH.me) return false; const t = SH.me.v; t.stop(); t.dispatchEvent(new Event('ended')); return true; },   // = the browser's own Stop sharing                                                        // a switch of device
       killRecorder: () => { if (R.rec) { R.rec.ondataavailable = null; R.rec.onstop = null; try { R.rec.stop(); } catch { /* */ } } } };   // a recorder that dies silently
     async function onSignal(from, name, data) {
       let pc = pcs.get(from);
@@ -522,7 +546,7 @@
       } else if (data.candidate && pc) { try { await pc.addIceCandidate(data.candidate); } catch { /* */ } }
     }
     function dropPeer(id, why) { note(id, 'drop:' + (why || 'left')); const pc = pcs.get(id); if (pc) { pcs.delete(id); pc.close(); } grid.querySelector(`[data-p="${id}"]`)?.remove(); updCnt(); retune(); }
-    function cleanup() { pcs.forEach((pc) => pc.close()); if (lkRoom) { const r = lkRoom; lkRoom = null; r.disconnect().catch(() => {}); } localStream.getTracks().forEach((t) => t.stop()); }
+    function cleanup() { if (SH.me) { [SH.me.v, SH.me.a].forEach((t) => { if (t) try { t.stop(); } catch { /* */ } }); SH.me = null; } pcs.forEach((pc) => pc.close()); if (lkRoom) { const r = lkRoom; lkRoom = null; r.disconnect().catch(() => {}); } localStream.getTracks().forEach((t) => t.stop()); }
 
     // ---------- SFU (LiveKit): one upload per browser (simulcast 180p/360p/540p), the server forwards it to everyone.
     // The /ws socket above stays the authority for who is in the meeting, recording and the end of the meeting.
@@ -549,14 +573,20 @@
           videoSimulcastLayers: [VideoPresets.h180, VideoPresets.h360], dtx: true, red: true } });
       lkRoom = room;
       room.on(RoomEvent.ParticipantConnected, (p) => { tileOf(p); flags(p); updCnt(); note(p.identity, 'joined'); })
-        .on(RoomEvent.ParticipantDisconnected, (p) => { tileEl(p.identity)?.remove(); updCnt(); note(p.identity, 'left'); })
-        .on(RoomEvent.TrackSubscribed, (track, pub, p) => { const t = tileOf(p);
+        .on(RoomEvent.ParticipantDisconnected, (p) => { tileEl(p.identity)?.remove(); removeScreen(p.identity); updCnt(); note(p.identity, 'left'); })
+        .on(RoomEvent.TrackSubscribed, (track, pub, p) => {
+          if (pub.source === Track.Source.ScreenShare) { addScreen(p, pub, track); return; }
+          if (pub.source === Track.Source.ScreenShareAudio) { const a = track.attach(); a.className = 'lkaudio'; a.dataset.s = p.identity; $('#shaudio').appendChild(a); return; }
+          const t = tileOf(p);
           if (track.kind === 'video') track.attach(t.querySelector('video'));
           else if (track.kind === 'audio') { const a = track.attach(); a.className = 'lkaudio'; t.appendChild(a); }
           flags(p); updCnt(); })
-        .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => { track.detach().forEach((el) => { if (el.tagName === 'AUDIO') el.remove(); }); flags(p); })
-        .on(RoomEvent.TrackMuted, (pub, p) => { if (!p.isLocal) flags(p); })
-        .on(RoomEvent.TrackUnmuted, (pub, p) => { if (!p.isLocal) flags(p); })
+        .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => { track.detach().forEach((el) => { if (el.tagName === 'AUDIO') el.remove(); });
+          if (pub.source === Track.Source.ScreenShare) removeScreen(p.identity); else flags(p); })
+        .on(RoomEvent.TrackMuted, (pub, p) => { if (p.isLocal) { if (pub.source === Track.Source.ScreenShare && SH.me) stopShare('muted by the server'); return; }
+          if (pub.source === Track.Source.ScreenShare) removeScreen(p.identity); else flags(p); })
+        .on(RoomEvent.TrackUnmuted, (pub, p) => { if (p.isLocal) return; if (pub.source === Track.Source.ScreenShare) { if (pub.track) addScreen(p, pub, pub.track); } else flags(p); })
+        .on(RoomEvent.LocalTrackUnpublished, (pub) => { if (pub.source === Track.Source.ScreenShare && SH.me) stopShare('unpublished'); })
         .on(RoomEvent.TrackPublished, (pub, p) => flags(p))
         .on(RoomEvent.TrackUnpublished, (pub, p) => flags(p))
         .on(RoomEvent.ActiveSpeakersChanged, (sp) => { const ids = new Set(sp.map((x) => (x.isLocal ? 'self' : x.identity)));
@@ -580,7 +610,9 @@
       speakSound(!room.canPlaybackAudio); updCnt();
     }
     function lkLost() {      // the SFU connection is gone for good (LiveKit's own resume gave up): new token, new connection
-      lkRoom = null; grid.querySelectorAll('.tile:not(.self)').forEach((t) => t.remove()); updCnt();
+      lkRoom = null; grid.querySelectorAll('.tile:not(.self)').forEach((t) => t.remove());
+      if (SH.me) stopShare('connection lost', true);
+      [...SH.screens.keys()].forEach(removeScreen); updCnt();
       if (ended) return;
       if (lkTries++ < 5) { cnt.textContent = 'reconnecting…'; setTimeout(() => { if (!ended) wsSend({ type: 'media-token' }); }, 1500 * lkTries); }
       else cnt.textContent = 'video disconnected — reload to rejoin';
@@ -607,6 +639,19 @@
         }
         out.remotes.push(o);
       }
+      out.screens = [];
+      for (const p of r.remoteParticipants.values()) {
+        const pub = p.getTrackPublication(S.ScreenShare); if (!pub) continue;
+        const o = { id: p.identity, name: p.name, kind: kindOf(pub.trackName), subscribed: !!pub.track, muted: pub.isMuted, quality: pub.videoQuality, frames: 0, w: 0, h: 0, fps: 0, inBytes: 0, audioBytes: 0 };
+        if (pub.track && pub.track.getRTCStatsReport) { const st = await pub.track.getRTCStatsReport().catch(() => null);
+          if (st) st.forEach((x) => { if (x.type === 'inbound-rtp' && x.kind === 'video') { o.frames = x.framesDecoded || 0; o.w = x.frameWidth || 0; o.h = x.frameHeight || 0; o.fps = x.framesPerSecond || 0; o.inBytes = x.bytesReceived || 0; } }); }
+        const ap = p.getTrackPublication(S.ScreenShareAudio);
+        if (ap && ap.track && ap.track.getRTCStatsReport) { const st = await ap.track.getRTCStatsReport().catch(() => null); if (st) st.forEach((x) => { if (x.type === 'inbound-rtp' && x.kind === 'audio') o.audioBytes = x.bytesReceived || 0; }); }
+        out.screens.push(o);
+      }
+      const ss = r.localParticipant.getTrackPublication(S.ScreenShare);
+      if (ss && ss.track && ss.track.getRTCStatsReport) { const st = await ss.track.getRTCStatsReport().catch(() => null); out.up.screen = [];
+        if (st) st.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'video') out.up.screen.push({ rid: x.rid || '', w: x.frameWidth || 0, h: x.frameHeight || 0, fps: x.framesPerSecond || 0, bytes: x.bytesSent || 0, active: x.active, limit: x.qualityLimitationReason }); }); }
       const v = r.localParticipant.getTrackPublication(S.Camera), a = r.localParticipant.getTrackPublication(S.Microphone);
       if (v && v.track && v.track.getRTCStatsReport) { const st = await v.track.getRTCStatsReport().catch(() => null);
         if (st) { st.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'video') out.up.layers.push({ rid: x.rid || '', w: x.frameWidth || 0, h: x.frameHeight || 0, fps: x.framesPerSecond || 0, bytes: x.bytesSent || 0, active: x.active, limit: x.qualityLimitationReason }); });
@@ -614,6 +659,164 @@
       if (a && a.track && a.track.getRTCStatsReport) { const st = await a.track.getRTCStatsReport().catch(() => null); if (st) st.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'audio') out.up.audio = x.bytesSent || 0; }); }
       return out;
     }
+    // ---------- screen sharing ----------
+    // Everyone may share (guests too), in SFU rooms. The share is its own LiveKit track (ScreenShare + ScreenShareAudio
+    // for tab audio); the camera keeps running. Tab audio is only played to the others: it never reaches the recorder,
+    // which records the microphone publication only (micTrack). The sharer never sees their own share full size.
+    const CAN_SHARE = !!(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function');
+    const UA = navigator.userAgent || '';
+    const CHROMIUM = !/Firefox|FxiOS/.test(UA) && (!!(navigator.userAgentData && navigator.userAgentData.brands && navigator.userAgentData.brands.some((b) => /Chromium|Chrome|Edge/.test(b.brand))) || /\b(Headless)?Chrome\/|\bEdg\//.test(UA));
+    const KIND_WORD = { browser: 'a tab', window: 'a window', monitor: 'their screen' };
+    const kindOf = (name) => { const k = String(name || '').split(':')[1]; return ['browser', 'window', 'monitor'].includes(k) ? k : 'screen'; };
+    let smoothPref = false; try { smoothPref = localStorage.getItem('osmike-meetings-smooth') === '1'; } catch { /* */ }
+    const NO_SHARE = 'This browser cannot share a screen (phones and tablets cannot). You can still watch what others share.';
+    function shareButton() {
+      const b = $('#share'); if (!b) return;
+      const on = !!SH.me;
+      b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
+      b.classList.toggle('unavail', !CAN_SHARE || mode !== 'sfu');
+      b.title = !CAN_SHARE ? NO_SHARE : mode !== 'sfu' ? 'Sharing needs the standard meeting mode' : on ? 'Stop sharing' : 'Share a tab, window or screen';
+      b.setAttribute('aria-label', b.title);
+      const bar = $('#sharebar'); bar.hidden = !on;
+      if (on) { $('#sbkind').textContent = SH.me.kind === 'browser' ? 'a tab' : SH.me.kind === 'window' ? 'a window' : 'your screen'; $('#smooth').checked = SH.me.smooth; }
+      layout();
+    }
+    // One full-size layer, no spatial simulcast (measured live 2026-11-25, Chrome 155 -> LiveKit 1.13): with an extra
+    // 360p layer Chrome's bandwidth estimate stalled at 0.5-0.9 Mbit/s, so the full layer never started and every viewer
+    // got 427x239 for 45 s+ (with a 720p extra layer the SFU even switched the full layer off: "720p is big enough").
+    // A single layer reached 1280x716 at 15 fps within 5 s (estimate 3-5.7 Mbit/s). The camera keeps its simulcast.
+    const ENC = { detail: { maxBitrate: 2_500_000, maxFramerate: 15 }, motion: { maxBitrate: 4_000_000, maxFramerate: 30 } };
+    async function startShare() {
+      if (!CAN_SHARE) { showToast(NO_SHARE, 5000); return; }
+      if (!joined || !lkRoom || mode !== 'sfu') { showToast(mode === 'mesh' && joined ? 'Sharing needs the standard meeting mode' : 'Wait until you are in the call', 4000); return; }
+      if (SH.me || SH.starting) return;
+      SH.starting = true;
+      const smooth = smoothPref;
+      // Chrome/Edge: the picker opens on "This tab / window / entire screen" with tabs first, offers the tab's sound,
+      // never offers this meeting tab itself, and lets the person switch what they share. Firefox/Safari: window or screen.
+      const video = { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, frameRate: { ideal: smooth ? 30 : 15, max: 30 } };
+      const opts = CHROMIUM ? { video: { ...video, displaySurface: 'browser' }, audio: true, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', systemAudio: 'exclude', preferCurrentTab: false }
+        : { video, audio: false };
+      let stream;
+      try { stream = await navigator.mediaDevices.getDisplayMedia(opts); }
+      catch (e) { SH.starting = false; if (e && e.name !== 'NotAllowedError' && e.name !== 'AbortError') showToast('Could not share: ' + (e.message || e.name)); note('share', 'picker: ' + (e && e.name)); return; }
+      const v = stream.getVideoTracks()[0], a = stream.getAudioTracks()[0] || null;
+      if (!v || ended || !lkRoom) { stream.getTracks().forEach((t) => t.stop()); SH.starting = false; return; }
+      const kind = (v.getSettings && v.getSettings().displaySurface) || 'screen';
+      try { v.contentHint = smooth ? 'motion' : 'detail'; } catch { /* */ }
+      if (a) { try { a.contentHint = 'music'; } catch { /* */ } }
+      const LK = window.LivekitClient, S = LK.Track.Source;
+      SH.me = { v, a, kind, smooth, vpub: null, apub: null };
+      v.addEventListener('ended', () => stopShare('stopped in the browser'), { once: true });   // the browser's own "Stop sharing"
+      if (a) a.addEventListener('ended', () => { if (SH.me && SH.me.a === a) stopShare('tab audio ended'); }, { once: true });
+      try {
+        SH.me.vpub = await lkRoom.localParticipant.publishTrack(v, { source: S.ScreenShare, name: 'screen:' + kind, simulcast: false, videoCodec: 'vp8',
+          screenShareEncoding: smooth ? ENC.motion : ENC.detail });
+        if (SH.me && SH.me.vpub.track && SH.me.vpub.track.setDegradationPreference) SH.me.vpub.track.setDegradationPreference(smooth ? 'maintain-framerate' : 'maintain-resolution').catch(() => {});
+        if (a && SH.me) SH.me.apub = await lkRoom.localParticipant.publishTrack(a, { source: S.ScreenShareAudio, name: 'screen-audio', dtx: false, red: false });
+      } catch (e) { note('share', 'publish failed: ' + (e && e.message)); showToast('Could not share: ' + ((e && e.message) || 'error')); SH.starting = false; stopShare('publish failed', true); return; }
+      SH.starting = false;
+      if (!SH.me) return;                                 // stopped while it was starting
+      $('#sharepv').srcObject = new MediaStream([v]);     // a small preview only: never the share full size (mirror tunnel)
+      wsSend({ type: 'share', on: true, kind, audio: !!a });
+      note('share', 'started ' + kind + (a ? ' + audio' : ''));
+      shareButton();
+    }
+    async function stopShare(why, quiet) {
+      const s = SH.me; if (!s) return;
+      SH.me = null;
+      [s.v, s.a].forEach((t) => { if (t) try { t.stop(); } catch { /* */ } });
+      const pv = $('#sharepv'); if (pv) pv.srcObject = null;
+      if (lkRoom) for (const t of [s.v, s.a]) { if (t) { try { await lkRoom.localParticipant.unpublishTrack(t, true); } catch { /* already gone */ } } }
+      wsSend({ type: 'share', on: false, why: why || '' });
+      note('share', 'stopped: ' + (why || ''));
+      shareButton();
+      if (!quiet && why === 'stopped in the browser') showToast('You stopped sharing');
+    }
+    async function setSmooth(on) {    // Smooth video = motion (30 fps, keeps the frame rate); off = detail (15 fps, sharpest text)
+      smoothPref = on; try { localStorage.setItem('osmike-meetings-smooth', on ? '1' : '0'); } catch { /* */ }
+      const s = SH.me; if (!s) return;
+      s.smooth = on;
+      try { s.v.contentHint = on ? 'motion' : 'detail'; } catch { /* */ }
+      s.v.applyConstraints({ frameRate: { ideal: on ? 30 : 15, max: 30 } }).catch(() => {});
+      const lt = s.vpub && s.vpub.track;
+      // one after the other: two setParameters at once make the second fail (each needs its own fresh getParameters)
+      if (lt && lt.setDegradationPreference) { try { await lt.setDegradationPreference(on ? 'maintain-framerate' : 'maintain-resolution'); } catch { /* */ } }
+      const snd = lt && lt.sender;
+      if (snd && snd.getParameters && SH.me === s) { try { const p = snd.getParameters(); const top = (p.encodings || [])[p.encodings.length - 1];
+        if (top) { Object.assign(top, on ? ENC.motion : ENC.detail); await snd.setParameters(p); } } catch (e) { note('share', 'smooth: ' + (e && e.message)); } }
+    }
+    $('#share').onclick = () => { if (SH.me) stopShare('button'); else startShare(); };
+    $('#sbstop').onclick = () => stopShare('button');
+    $('#smooth').onchange = (e) => setSmooth(e.target.checked);
+    shareButton();
+
+    // Others' shares: the share takes the stage, the people become a filmstrip. Two shares: a switcher above the stage.
+    function addScreen(p, pub, track) {
+      let x = SH.screens.get(p.identity);
+      if (!x) {
+        const el = document.createElement('div'); el.className = 'sh-item'; el.dataset.s = p.identity;
+        el.innerHTML = '<video autoplay playsinline muted></video>';
+        $('#shview').appendChild(el);
+        x = { id: p.identity, el, at: Date.now() }; SH.screens.set(p.identity, x);
+        SH.sel = p.identity;                 // the newest share comes on the stage
+        zoomable(el);
+      }
+      x.name = p.name || 'Guest'; x.kind = kindOf(pub.trackName); x.pub = pub;
+      if (x.track !== track) { if (x.track) x.track.detach(x.el.querySelector('video')); x.track = track; track.attach(x.el.querySelector('video')); }
+      renderScreens();
+    }
+    function removeScreen(id) {
+      const x = SH.screens.get(id); if (!x) return;
+      if (x.track) { try { x.track.detach(x.el.querySelector('video')); } catch { /* */ } }
+      x.el.remove(); SH.screens.delete(id);
+      if (SH.sel === id) SH.sel = null;
+      renderScreens();
+    }
+    function renderScreens() {
+      const list = [...SH.screens.values()].sort((a, b) => a.at - b.at);
+      const room = $('.room'); if (!room) return;
+      room.classList.toggle('sharing', list.length > 0);
+      $('#screens').hidden = !list.length;
+      if (!list.length) { if (document.fullscreenElement === $('#screens')) document.exitFullscreen().catch(() => {}); layout(); return; }
+      if (!SH.screens.has(SH.sel)) SH.sel = list[list.length - 1].id;
+      const cur = SH.screens.get(SH.sel);
+      const tabs = $('#shtabs');
+      tabs.innerHTML = list.length > 1 ? list.map((x) => `<button type="button" role="tab" class="sh-tab" data-s="${esc(x.id)}" aria-selected="${x.id === SH.sel}">${esc(x.name)}</button>`).join('') : '';
+      tabs.querySelectorAll('.sh-tab').forEach((b) => { b.onclick = () => { SH.sel = b.dataset.s; renderScreens(); }; });
+      $('#shpill').textContent = `${cur.name} is sharing ${KIND_WORD[cur.kind] || 'their screen'}`;
+      list.forEach((x) => { x.el.hidden = x.id !== SH.sel; });     // a hidden share is paused by the SFU (adaptive stream)
+      const st = $('#shstop'); st.hidden = !isHost;
+      st.onclick = () => { const t = SH.screens.get(SH.sel); if (!t) return;
+        if (confirm(`Stop ${t.name}'s share for everyone?`)) wsSend({ type: 'stop-share', target: t.id }); };
+      layout();
+    }
+    $('#shfull').onclick = async () => {
+      const box = $('#screens'), vid = SH.screens.get(SH.sel)?.el.querySelector('video');
+      if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+      if (box.requestFullscreen) { try { await box.requestFullscreen(); try { await screen.orientation.lock('landscape'); } catch { /* not on desktop */ } } catch { /* */ } }
+      else if (vid && vid.webkitEnterFullscreen) vid.webkitEnterFullscreen();      // iPhone: the video's own full screen
+    };
+    // Pinch (two fingers) or ctrl+wheel zooms the share, one finger / mouse drags it while zoomed, double tap resets.
+    function zoomable(el) {
+      const z = { s: 1, x: 0, y: 0 }, pts = new Map(); let start = null, lastTap = 0;
+      const apply = () => { const v = el.querySelector('video'); z.s = Math.min(5, Math.max(1, z.s)); if (z.s === 1) { z.x = 0; z.y = 0; }
+        const mx = (el.clientWidth * (z.s - 1)) / 2, my = (el.clientHeight * (z.s - 1)) / 2;
+        z.x = Math.min(mx, Math.max(-mx, z.x)); z.y = Math.min(my, Math.max(-my, z.y));
+        v.style.transform = z.s === 1 ? '' : `translate(${z.x}px,${z.y}px) scale(${z.s})`; el.classList.toggle('zoomed', z.s > 1); };
+      const dist = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+      el.addEventListener('pointerdown', (e) => { pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); try { el.setPointerCapture(e.pointerId); } catch { /* */ }
+        start = pts.size === 2 ? { d: dist(), s: z.s } : { px: e.clientX, py: e.clientY, x: z.x, y: z.y };
+        if (pts.size === 1 && e.pointerType === 'touch') { const now = Date.now(); if (now - lastTap < 300) { z.s = z.s > 1 ? 1 : 2; apply(); } lastTap = now; } });
+      el.addEventListener('pointermove', (e) => { if (!pts.has(e.pointerId)) return; pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pts.size === 2 && start && start.d) { z.s = start.s * dist() / start.d; apply(); }
+        else if (pts.size === 1 && start && start.px !== undefined && z.s > 1) { z.x = start.x + e.clientX - start.px; z.y = start.y + e.clientY - start.py; apply(); } });
+      const up = (e) => { pts.delete(e.pointerId); const [r] = [...pts.values()]; start = r ? { px: r.x, py: r.y, x: z.x, y: z.y } : null; };
+      el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+      el.addEventListener('dblclick', () => { z.s = z.s > 1 ? 1 : 2; apply(); });
+      el.addEventListener('wheel', (e) => { if (!e.ctrlKey && z.s === 1) return; e.preventDefault(); z.s *= Math.exp(-e.deltaY / 300); apply(); }, { passive: false });
+    }
+
     function endedScreen(by) {
       ended = true; cleanup();
       shell(`<section class="card auth"><p class="eyebrow">Meeting ended</p><h1>${by ? esc(by.charAt(0).toUpperCase() + by.slice(1)) : 'The meeting has ended'}</h1>
@@ -644,7 +847,8 @@
     }
     function onWsMessage(ev) { let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === 'welcome') {
-        meetingId = m.meeting; resumeKey = m.resume || null; selfId = m.self; wsTries = 0; if (m.is_host) $('#endall').hidden = false;
+        meetingId = m.meeting; resumeKey = m.resume || null; selfId = m.self; wsTries = 0; if (m.is_host) { $('#endall').hidden = false; isHost = true; }
+        mode = m.media === 'sfu' ? 'sfu' : 'mesh'; shareButton();
         if (m.resumed) {       // back in the same place: keep the pictures and the recording (same file on the server)
           note('ws', 'resumed'); updCnt();
           const firstStart = R.out.findIndex((x) => !(x instanceof ArrayBuffer) && x.type === 'rec-start');
@@ -671,6 +875,8 @@
       else if (m.type === 'ended') { stopRecording(); endedScreen(m.by && m.by.startsWith('ended by') ? `ended by ${m.by.slice(9)}` : ''); }
       else if (m.type === 'error' && m.error === 'name_required') { ended = true; cleanup(); renderJoin(roomId, 'Type your name to join.'); }
       else if (m.type === 'error' && m.error === 'only_the_host_can_end') showToast('Only the host can end the meeting for everyone');
+      else if (m.type === 'share-stopped') { stopShare('stopped by the host', true); showToast(`${m.by || 'The host'} stopped your screen share`, 5000); }
+      else if (m.type === 'stop-share-result') showToast(m.ok ? `Stopped the share of ${m.name || 'that person'}` : m.error === 'only_the_host_can_stop_shares' ? 'Only the host can stop someone else\'s share' : 'Could not stop that share');
     }
     connectWs();
 

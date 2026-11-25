@@ -148,7 +148,7 @@ export function createApp(env = process.env, deps = {}) {
   function iceServers() {
     const list = [{ urls: `stun:${cfg.TURN_HOST}:${cfg.TURN_PORT}` }];
     if (cfg.TURN_SECRET) {
-      const username = `${Math.floor(Date.now() / 1000) + 3600}:meetings`;
+      const username = `${Math.floor(Date.now() / 1000) + 3600}:meetings-${rid(8)}`; // one per browser: coturn's user-quota counts per username
       const credential = crypto.createHmac('sha1', cfg.TURN_SECRET).update(username).digest('base64');
       list.push({ urls: `turn:${cfg.TURN_HOST}:${cfg.TURN_PORT}?transport=udp`, username, credential });
       list.push({ urls: `turn:${cfg.TURN_HOST}:${cfg.TURN_PORT}?transport=tcp`, username, credential });
@@ -323,7 +323,8 @@ export function createApp(env = process.env, deps = {}) {
   }
 
   function leave(ws) {
-    const live = liveRooms.get(ws.roomId);
+    const roomId = ws.roomId;           // the Leave button clears ws.roomId right after this: the end timer must not read it later
+    const live = liveRooms.get(roomId);
     closeRec(ws);
     if (!live || !live.peers.has(ws.peerId)) return;
     live.peers.delete(ws.peerId);
@@ -333,7 +334,7 @@ export function createApp(env = process.env, deps = {}) {
     for (const [, o] of live.peers) send(o, { type: 'peer-left', id: ws.peerId });
     if (live.peers.size === 0) {
       clearTimeout(live.endTimer);
-      live.endTimer = setTimeout(() => endMeeting(ws.roomId, 'everyone left'), cfg.END_GRACE_MS);
+      live.endTimer = setTimeout(() => endMeeting(roomId, 'everyone left'), cfg.END_GRACE_MS);
     }
   }
 

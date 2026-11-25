@@ -178,6 +178,15 @@ test('a meeting with only guests keeps nothing', async () => {
   assert.equal(fs.existsSync(path.join(dir, 'meetings', wel.meeting)), false);
 });
 
+test('the last person pressing Leave ends the meeting (not only closing the tab)', async () => {
+  const g = await wsOpen(null); g.send(JSON.stringify({ type: 'join', room: 'roomFour', name: 'Leaver' }));
+  const wel = await waitFor(() => g.msgs.find((m) => m.type === 'welcome'));
+  g.send(JSON.stringify({ type: 'leave' }));
+  await waitFor(() => !M.liveRooms.has('roomFour'));
+  assert.equal(M.store.meeting(wel.meeting), null);
+  g.close();
+});
+
 test('pipeline helpers', async () => {
   const t = buildTranscript([
     { t0: 1000, offset: 0, speaker: 'A', segments: [{ start: 0, end: 1, text: 'Hej' }, { start: 1.5, end: 2, text: 'alla' }] },

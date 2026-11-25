@@ -255,9 +255,14 @@
     }
     window.addEventListener('resize', layout);
 
-    try { localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: true }); }
-    catch { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); showToast('No camera — joining with sound only'); }
-      catch { localStream = new MediaStream(); showToast('Camera and microphone are blocked — check the browser permissions'); } }
+    // ~640x360 at 24 fps: every browser sends its camera to every other one (mesh), so a small picture keeps 6–10
+    // people smooth. "ideal" lets phones (iPhone Safari) pick their nearest mode; the second try is the plain camera.
+    const AUDIO = { echoCancellation: true, noiseSuppression: true };
+    const VIDEO = { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' };
+    try { localStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO, video: VIDEO }); }
+    catch { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO, video: true }); } catch { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); showToast('No camera — joining with sound only'); }
+      catch { localStream = new MediaStream(); showToast('Camera and microphone are blocked — check the browser permissions'); } } }
+    localStream.getVideoTracks().forEach((t) => { try { t.contentHint = 'motion'; } catch { /* */ } });
     tile('self', myName + ' (you)').querySelector('video').srcObject = localStream;
     updCnt();
     iceServers = (await api('/api/ice')).iceServers || [];
@@ -277,25 +282,94 @@
       return new Promise((res) => { if (!rec || rec.state === 'inactive') return res();
         const t = setTimeout(res, 2000); rec.onstop = () => setTimeout(() => { clearTimeout(t); res(); }, 300); try { rec.stop(); } catch { res(); } });
     }
+    // Upload budget. Each browser encodes its camera once per other person, so the per-person bitrate falls as the
+    // room grows: total upload stays around 2–3 Mbps. Audio (Opus) is never touched.
+    function videoTier(n) {
+      if (n <= 2) return { maxBitrate: 1_200_000, maxFramerate: 24, scaleResolutionDownBy: 1 };
+      if (n <= 4) return { maxBitrate: 600_000, maxFramerate: 24, scaleResolutionDownBy: 1 };
+      if (n <= 7) return { maxBitrate: 350_000, maxFramerate: 20, scaleResolutionDownBy: 1.333 };
+      return { maxBitrate: 200_000, maxFramerate: 15, scaleResolutionDownBy: 1.5 };
+    }
+    async function tuneSender(sender, tier) {
+      if (!sender.track || sender.track.kind !== 'video' || !sender.getParameters || !sender.setParameters) return;
+      try {
+        const p = sender.getParameters();             // Safari refuses setParameters without a fresh getParameters
+        if (!p.encodings || !p.encodings.length) return; // not negotiated yet: tuned again when connected
+        const e = p.encodings[0], same = e.maxBitrate === tier.maxBitrate && e.maxFramerate === tier.maxFramerate && e.scaleResolutionDownBy === tier.scaleResolutionDownBy;
+        if (same) return;
+        Object.assign(e, tier);
+        p.degradationPreference = 'balanced';
+        try { await sender.setParameters(p); }
+        catch { const q = sender.getParameters(); if (!q.encodings || !q.encodings.length) return;   // a browser that rejects a field
+          q.encodings[0].maxBitrate = tier.maxBitrate; try { await sender.setParameters(q); } catch { /* unsupported: browser default */ } }
+      } catch { /* no setParameters support */ }
+    }
+    let tuneT = null;
+    function retune() { clearTimeout(tuneT); tuneT = setTimeout(() => { const tier = videoTier(pcs.size);
+      pcs.forEach((pc) => pc.getSenders().forEach((s) => tuneSender(s, tier))); }, 250); }
+
+    // A dropped network (Wi-Fi switch, a short outage, a frozen picture) gets one ICE restart before the tile goes.
+    // Only the side that sent the first offer restarts, so the two never offer at the same time; the other side asks.
+    function heal(peerId, why) {
+      const pc = pcs.get(peerId); if (!pc || pc.connectionState === 'closed') return;
+      note(peerId, 'heal:' + why); if (pc._healing) { if (why === 'failed') dropPeer(peerId, 'failed again after restart'); return; }
+      pc._healing = Date.now();
+      if (!pc._initiator) { wsSend({ type: 'signal', to: peerId, data: { restart: true } }); setTimeout(() => { const p = pcs.get(peerId);
+        if (p !== pc) return; if (['connected', 'completed'].includes(pc.connectionState)) pc._healing = 0; else dropPeer(peerId, 'no restart from the other side'); }, 20000); return; }
+      restartIce(peerId);
+    }
+    async function restartIce(peerId) {
+      const pc = pcs.get(peerId); if (!pc) return;
+      if (pc.signalingState !== 'stable') { if ((pc._rt = (pc._rt || 0) + 1) < 6) setTimeout(() => restartIce(peerId), 1500); else pc._healing = 0; return; }
+      pc._rt = 0; pc._healing = pc._healing || Date.now(); note(peerId, 'ice-restart');
+      try { if (pc.restartIce) pc.restartIce();
+        const o = await pc.createOffer({ iceRestart: true }); await pc.setLocalDescription(o);
+        wsSend({ type: 'signal', to: peerId, data: { sdp: pc.localDescription } }); } catch (e) { dropPeer(peerId, 'restart offer failed: ' + e); return; }
+      setTimeout(() => { const p = pcs.get(peerId); if (p !== pc) return; if (['connected', 'completed'].includes(pc.connectionState)) pc._healing = 0; else dropPeer(peerId, 'restart did not reconnect'); }, 20000);
+    }
+    const dbg = [];   // last connection events, for diagnostics (window.osmikeMeeting.log)
+    const note = (id, e) => { dbg.push([new Date().toISOString().slice(11, 23), String(id).slice(0, 5), e]); if (dbg.length > 400) dbg.shift(); };
+    const FORCE_RELAY = new URLSearchParams(location.search).get('relay') === '1'; // test only: TURN path
     function makePC(peerId, name, initiator) {
-      const pc = new RTCPeerConnection({ iceServers });
+      const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all' });
+      pc._initiator = initiator;
       pcs.set(peerId, pc);
       localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
       pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type: 'signal', to: peerId, data: { candidate: e.candidate } }); };
       pc.ontrack = (e) => { tile(peerId, name).querySelector('video').srcObject = e.streams[0]; updCnt(); };
-      pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) dropPeer(peerId); };
+      let discT = null;
+      pc.onconnectionstatechange = () => {
+        const st = pc.connectionState; note(peerId, st);
+        clearTimeout(discT);
+        if (st === 'connected') { retune(); if (pc._healing) setTimeout(() => { if (pc.connectionState === 'connected') pc._healing = 0; }, 15000); }
+        else if (st === 'disconnected') discT = setTimeout(() => { if (pc.connectionState === 'disconnected') heal(peerId, 'disconnected'); }, 3000);
+        else if (st === 'failed') heal(peerId, 'failed');
+        else if (st === 'closed') dropPeer(peerId, 'closed');
+      };
       if (initiator) pc.createOffer().then((o) => pc.setLocalDescription(o)).then(() => wsSend({ type: 'signal', to: peerId, data: { sdp: pc.localDescription } })).catch(() => {});
-      updCnt(); return pc;
+      updCnt(); retune(); return pc;
     }
+    // A picture that stops moving while the connection still says "connected" (no frames decoded for ~10 s).
+    const freezeT = setInterval(() => { if (ended) return clearInterval(freezeT);
+      pcs.forEach((pc, id) => { if (pc.connectionState !== 'connected' || pc._healing) return;
+        pc.getStats().then((st) => { let f = null, a = 0; st.forEach((r) => { if (r.type === 'inbound-rtp' && r.kind === 'video') f = (f || 0) + (r.framesDecoded || 0);
+            if (r.type === 'inbound-rtp' && r.kind === 'audio') a += r.packetsReceived || 0; });
+          if (f == null) return;
+          // a camera switched off still lets sound through: only picture AND sound standing still counts as frozen
+          const moving = f > (pc._frames ?? -1) || a > (pc._audio ?? -1);
+          pc._frames = f; pc._audio = a;
+          if (moving) pc._still = 0; else if (++pc._still >= 3) { pc._still = 0; heal(id, 'frozen'); } }).catch(() => {}); }); }, 3500);
+    window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg };   // for diagnostics and the load test
     async function onSignal(from, name, data) {
       let pc = pcs.get(from);
+      if (data.restart) { if (pc && pc._initiator && !pc._healing) heal(from, 'asked'); return; }
       if (data.sdp) {
         if (!pc) pc = makePC(from, name, false);
         await pc.setRemoteDescription(data.sdp);
         if (data.sdp.type === 'offer') { const a = await pc.createAnswer(); await pc.setLocalDescription(a); wsSend({ type: 'signal', to: from, data: { sdp: pc.localDescription } }); }
       } else if (data.candidate && pc) { try { await pc.addIceCandidate(data.candidate); } catch { /* */ } }
     }
-    function dropPeer(id) { const pc = pcs.get(id); if (pc) { pc.close(); pcs.delete(id); } grid.querySelector(`[data-p="${id}"]`)?.remove(); updCnt(); }
+    function dropPeer(id, why) { note(id, 'drop:' + (why || 'left')); const pc = pcs.get(id); if (pc) { pcs.delete(id); pc.close(); } grid.querySelector(`[data-p="${id}"]`)?.remove(); updCnt(); retune(); }
     function cleanup() { pcs.forEach((pc) => pc.close()); localStream.getTracks().forEach((t) => t.stop()); }
     function endedScreen(by) {
       ended = true; cleanup();

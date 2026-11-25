@@ -60,13 +60,22 @@
   }
   function shell(inner) { app.innerHTML = `${header()}<main id="main" class="wrap">${inner}</main>`; wireHeader(); }
 
+  const pendingOf = (m) => m.status === 'queued' || m.status === 'processing' || (m.status === 'live' && m.live_state !== 'running');
   const statusBadge = (m) => {
-    if (m.status === 'done') return m.has_summary ? '<span class="badge ok">Summary ready</span>' : '<span class="badge">No speech recorded</span>';
+    if (m.status === 'done') return m.has_summary && m.lines !== 0 ? '<span class="badge ok">Summary ready</span>' : '<span class="badge">No speech recorded</span>';
+    if (m.status === 'live') return m.live_state === 'running' ? '<span class="badge live">In progress</span>' : '<span class="badge live">Transcribing…</span>';
     if (m.status === 'failed') return '<span class="badge warn"><span aria-hidden="true">!</span> Transcription failed</span>';
     if (m.stage === 'summarizing') return '<span class="badge live">Writing summary…</span>';
     if (m.status === 'processing') return '<span class="badge live">Transcribing…</span>';
-    return '<span class="badge live">Waiting to transcribe</span>';
+    return '<span class="badge live">Transcribing…</span>';
   };
+  // While a listed meeting is still being transcribed the list reloads itself until it is done (no manual reload).
+  function pollPast(load, list) {
+    clearTimeout(pollPast.t);
+    if (!list.some(pendingOf) && !list.some((m) => m.status === 'live')) return;
+    const at = location.pathname;
+    pollPast.t = setTimeout(() => { if (location.pathname === at && document.querySelector('#past')) load(); }, 6000);
+  }
   function pastRows(list) {
     if (!list.length) return '<p class="empty muted">No previous meetings yet. When a meeting you were in ends, its transcript and summary show up here.</p>';
     return `<ul class="rows">${list.map((m) => `<li><a class="row past" href="/m/${esc(m.id)}">
@@ -116,8 +125,9 @@
       if (r.saved) { showToast('Scheduled — it is in your calendar'); e.target.reset(); loadUpcoming(); } else showToast('Could not save: ' + (r.error || 'error'));
     };
     loadUpcoming();
-    const p = await api('/api/past');
-    $('#past').innerHTML = pastRows((p.meetings || []).slice(0, 6));
+    const loadPast = async () => { const p = await api('/api/past'); const ms = (p.meetings || []).slice(0, 6);
+      if (!$('#past')) return; $('#past').innerHTML = pastRows(ms); pollPast(loadPast, ms); };
+    loadPast();
   }
   function wireJoin() {
     $('#joinform').onsubmit = (e) => { e.preventDefault(); const v = $('#joincode').value.trim();
@@ -139,7 +149,8 @@
       <form class="search" id="sform" role="search"><label class="sr-only" for="q">Search titles, people and what was said</label>
       <input id="q" type="search" placeholder="Search titles, people and what was said"><button class="btn secondary" type="submit">Search</button></form>
       <p class="small muted">Only meetings you were in. Times in ${esc(TZ)}.</p><div id="past"><p class="muted">Loading…</p></div>`);
-    const load = async () => { const r = await api('/api/past?q=' + encodeURIComponent($('#q').value)); $('#past').innerHTML = pastRows(r.meetings || []); };
+    const load = async () => { const r = await api('/api/past?q=' + encodeURIComponent($('#q').value)); if (!$('#past')) return;
+      $('#past').innerHTML = pastRows(r.meetings || []); pollPast(load, r.meetings || []); };
     $('#sform').onsubmit = (e) => { e.preventDefault(); load(); };
     load();
   }
@@ -154,9 +165,15 @@
     }
     const s = m.summary;
     const list = (arr) => arr && arr.length ? `<ul class="bul">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : '<p class="muted small">None.</p>';
-    const pending = m.status === 'queued' || m.status === 'processing';
-    const stateNote = m.status === 'failed' ? `<p class="error"><span aria-hidden="true">!</span>The transcription failed (${esc(m.error)}). It will not be retried automatically.</p>`
-      : pending ? `<p class="notice" role="status">${m.stage === 'summarizing' ? 'Writing the summary…' : m.status === 'processing' ? 'Transcribing the recording…' : 'Waiting for its turn to be transcribed…'} This page updates by itself.</p>`
+    // Before the transcript is done the page never says "No speech": 'live' (still going, or everyone just left and it
+    // closes in under a minute), 'queued' and 'processing' all show progress and the page reloads itself until done.
+    const running = m.status === 'live' && m.live_state === 'running';
+    const pending = running || pendingOf(m);
+    const prog = m.progress && m.progress.total ? ` (part ${Math.min(m.progress.done + 1, m.progress.total)} of ${m.progress.total})` : '';
+    const stateNote = m.status === 'failed' ? `<p class="error" role="alert"><span aria-hidden="true">!</span>The transcription failed (${esc(m.error)}). It will not be retried automatically.</p>`
+      : running ? `<p class="notice" role="status">This meeting is still going on. The transcript and summary come when it has ended. <a href="/r/${esc(m.room)}">Rejoin</a></p>`
+      : pending ? `<p class="notice pending" role="status"><span class="spin" aria-hidden="true"></span><span><strong>${m.stage === 'summarizing' ? 'Writing the summary…' : 'Transcribing…' + esc(prog)}</strong>
+          The transcript and summary are usually ready within a few minutes. This page updates by itself.</span></p>`
       : (!m.transcript.length ? '<p class="notice">No speech was recorded in this meeting.</p>' : '');
     const summary = s ? `<section class="card"><h2 class="card-title">Summary</h2>
         ${s.overview ? `<p class="lede">${esc(s.overview)}</p>` : ''}
@@ -179,7 +196,8 @@
     const del = $('#del');
     if (del) del.onclick = async () => { if (!confirm('Delete this meeting, its recording, transcript and summary for everyone?')) return;
       const r = await api('/api/past/' + encodeURIComponent(id), { method: 'DELETE' }); if (r.deleted) location.href = '/past'; else showToast('Could not delete'); };
-    if (pending) setTimeout(() => { if (location.pathname === '/m/' + id) renderMeeting(id); }, 8000);
+    clearTimeout(renderMeeting.t);
+    if (pending) renderMeeting.t = setTimeout(() => { if (location.pathname === '/m/' + id) renderMeeting(id); }, running ? 15000 : 4000);
   }
 
   // ===================== join screen + call =====================
@@ -226,7 +244,7 @@
   async function renderRoom(roomId, guestName, sfuLikely) {
     app.innerHTML = `${ICONS}<div class="room">
       <div class="roomtop"><a class="brand light" href="/" aria-label="Meetings home"><span class="mark" aria-hidden="true"></span></a>
-        <span class="rec" title="This meeting is recorded and transcribed">${icon('rec')}Recorded</span>
+        <span class="rec" id="recst" role="status" title="This meeting is recorded and transcribed">${icon('rec')}<span class="rt">Rec</span></span>
         <span class="cnt" id="cnt">connecting…</span><span class="grow"></span>
         <button class="btn ghostdark" id="copy" type="button">${icon('link')}<span class="hide-s">Copy link</span></button></div>
       <div class="stage" id="grid"></div>
@@ -239,7 +257,7 @@
       </div></div>`;
     const copy = () => { navigator.clipboard?.writeText(location.origin + '/r/' + roomId); showToast('Link copied'); };
     $('#copy').onclick = copy; $('#copy2').onclick = copy;
-    let localStream, iceServers = [], ws, rec = null, meetingId = null, ended = false, mode = 'mesh', lkRoom = null;
+    let localStream, iceServers = [], ws, meetingId = null, ended = false, mode = 'mesh', lkRoom = null;
     const pcs = new Map();
     const grid = $('#grid'), cnt = $('#cnt');
     const myName = me.authenticated ? me.user.name : guestName;
@@ -283,20 +301,134 @@
     iceServers = (await api('/api/ice')).iceServers || [];
 
     const wsSend = (o) => { try { if (ws.readyState === 1) ws.send(typeof o === 'string' || o instanceof ArrayBuffer ? o : JSON.stringify(o)); } catch { /* */ } };
-    function startRecording() {
-      const a = localStream.getAudioTracks()[0];
-      if (!a || !window.MediaRecorder) return;
-      const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => MediaRecorder.isTypeSupported(t));
-      if (!mime) return;
-      try { rec = new MediaRecorder(new MediaStream([a]), { mimeType: mime, audioBitsPerSecond: 32000 }); } catch { rec = null; return; }
-      wsSend({ type: 'rec-start', mime });
-      rec.ondataavailable = (e) => { if (e.data && e.data.size) e.data.arrayBuffer().then((b) => wsSend(b)); };
-      rec.start(4000);
+
+    // ---------- recording ----------
+    // Each browser records only its own microphone (MediaRecorder, 4 s chunks) and streams it over the meeting socket.
+    // A MediaRecorder is bound to one microphone track and ends silently when that track ends or is swapped (LiveKit
+    // re-acquires the microphone when it ends or the default device changes; a headset is plugged in; the OS takes the
+    // device). So: the recorder restarts whenever the microphone track changes or ends, when the recorder stops by itself,
+    // when no chunk came for 10 s while unmuted, and when the server says it gets no audio. While the socket is away the
+    // chunks are kept (in order) and sent into the same recording when it is back; a muted microphone records silence.
+    const R = { rec: null, track: null, seg: null, startPending: false, out: [], outBytes: 0, chain: Promise.resolve(), lastChunk: 0,
+      restarts: 0, state: 'off', why: '', restarting: false, ready: false, log: [] };
+    const OUT_MAX = 24 * 1024 * 1024;         // ~1.5 h of 32 kbit/s audio held while the socket is away
+    const recNote = (t) => { R.log.push(new Date().toISOString().slice(11, 19) + ' ' + t); if (R.log.length > 40) R.log.shift(); note('rec', t); };
+    function micTrack() {      // the microphone track that is live now (LiveKit may have replaced ours)
+      if (mode === 'sfu' && lkRoom && window.LivekitClient) {
+        const pub = lkRoom.localParticipant.getTrackPublication(window.LivekitClient.Track.Source.Microphone);
+        const t = pub && pub.track && pub.track.mediaStreamTrack;
+        if (t && t.readyState === 'live') return t;
+      }
+      return localStream.getAudioTracks().find((t) => t.readyState === 'live') || null;
     }
-    function stopRecording() {
+    function flushRec() {
+      if (!R.ready || !ws || ws.readyState !== 1) return;
+      while (R.out.length) {
+        const x = R.out.shift();
+        try { ws.send(x instanceof ArrayBuffer ? x : JSON.stringify(x)); } catch { R.out.unshift(x); return; }
+        if (x instanceof ArrayBuffer) R.outBytes -= x.byteLength;
+        else if (x.type === 'rec-start') { R.seg = null; R.startPending = true; }   // the next chunks belong to a recording the server will name
+      }
+    }
+    const recOut = (item) => { R.chain = R.chain.then(async () => {          // keeps chunks and control messages in order
+      const x = typeof item === 'function' ? await item() : item;
+      if (!x) return;
+      if (x instanceof ArrayBuffer) { if (R.outBytes + x.byteLength > OUT_MAX) return; R.outBytes += x.byteLength; }
+      R.out.push(x); flushRec();
+    }).catch(() => {}); };
+    function setRec(state, why) {
+      R.state = state; if (why !== undefined) R.why = why;
+      const el = $('#recst'); if (!el) return;
+      const on = state === 'on' && (ws && ws.readyState === 1 && R.ready);
+      el.classList.toggle('on', on); el.classList.toggle('warn', !on);
+      el.querySelector('.rt').textContent = state === 'none' ? 'Not recording' : on ? 'Rec' : 'Rec…';
+      el.title = state === 'none' ? `Your microphone is not being recorded (${R.why}). The others are still recorded.`
+        : on ? 'You are being recorded and transcribed' : 'Reconnecting the recording…';
+    }
+    function stopRecorder() {
+      const rec = R.rec; R.rec = null; R.track = null;
       return new Promise((res) => { if (!rec || rec.state === 'inactive') return res();
-        const t = setTimeout(res, 2000); rec.onstop = () => setTimeout(() => { clearTimeout(t); res(); }, 300); try { rec.stop(); } catch { res(); } });
+        rec._stopping = true; const t = setTimeout(res, 2000);
+        rec.onstop = () => setTimeout(() => { clearTimeout(t); res(); }, 50); try { rec.stop(); } catch { res(); } });
     }
+    async function startRecording(why) {
+      if (ended) return;
+      await stopRecorder();      // the old recorder's last chunk is queued before the new recording starts
+      const a = micTrack();
+      const mime = window.MediaRecorder && ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'].find((t) => MediaRecorder.isTypeSupported(t));
+      let rec = null;
+      if (a && mime) { try { rec = new MediaRecorder(new MediaStream([a]), { mimeType: mime, audioBitsPerSecond: 32000 }); } catch { rec = null; } }
+      if (!rec) { const w = !a ? 'no microphone' : 'this browser cannot record'; recNote('cannot record: ' + w); setRec('none', w); recOut({ type: 'rec-none', why: w }); return; }
+      R.rec = rec; R.track = a; R.lastChunk = Date.now();
+      recOut({ type: 'rec-start', mime, why: why || '' });
+      rec.ondataavailable = (e) => { if (!e.data || !e.data.size) return; if (rec === R.rec) R.lastChunk = Date.now(); recOut(() => e.data.arrayBuffer()); };
+      rec.onstop = () => { if (!rec._stopping && rec === R.rec) restartSoon('the recorder stopped'); };
+      rec.onerror = () => { if (rec === R.rec) restartSoon('recorder error'); };
+      a.addEventListener('ended', () => { if (a === R.track) restartSoon('the microphone ended', 3000); }, { once: true });
+      try { rec.start(4000); } catch { R.rec = null; restartSoon('recorder did not start', 3000); return; }
+      recNote('recording ' + (why || 'started') + ' on ' + (a.label || a.id).slice(0, 40));
+      setRec('on', '');
+    }
+    function stopRecording() { return stopRecorder().then(() => new Promise((r) => { recOut(null); R.chain.then(() => setTimeout(r, 250)); })); }
+    function restartSoon(why, delay = 0) {
+      if (R.restarting || ended || leaving) return;
+      R.restarting = true; setRec('restarting', why);
+      setTimeout(async () => {
+        try {
+          if (ended) return;
+          // SFU: LiveKit re-acquires an ended microphone itself; taking one at the same time makes it stop ours and mute
+          if (mode === 'sfu' && lkRoom) for (let i = 0; i < 16 && !micTrack(); i++) await new Promise((r) => setTimeout(r, 500));
+          if (ended || leaving) return;
+          if (!micTrack() && localStream.getAudioTracks().length) await reacquireMic(why);   // nobody brought a new microphone back
+          syncMute();
+          R.restarts++; recNote('restart: ' + why);
+          await startRecording(why);
+        } finally { R.restarting = false; }
+      }, delay);
+    }
+    // A new microphone track (the old one ended, or a switch of device): into the stream, the call and the recording.
+    async function reacquireMic(why) {
+      let t = null;
+      try { t = (await navigator.mediaDevices.getUserMedia({ audio: AUDIO })).getAudioTracks()[0] || null; } catch { t = null; }
+      if (!t) { recNote('could not get the microphone back (' + why + ')'); return null; }
+      t.enabled = micOn;
+      localStream.getAudioTracks().forEach((o) => { localStream.removeTrack(o); try { o.stop(); } catch { /* */ } });
+      localStream.addTrack(t);
+      if (mode === 'sfu' && lkRoom && window.LivekitClient) {
+        const pub = lkRoom.localParticipant.getTrackPublication(window.LivekitClient.Track.Source.Microphone);
+        if (pub && pub.track) { try { await pub.track.replaceTrack(t, true); if (!micOn) await pub.mute(); } catch (e) { recNote('replace in SFU failed: ' + e.message); } }
+      } else pcs.forEach((pc) => pc.getSenders().forEach((sn) => { if (sn.track && sn.track.kind === 'audio') sn.replaceTrack(t).catch(() => {}); }));
+      recNote('microphone re-acquired (' + why + ')');
+      return t;
+    }
+    // The microphone must be on exactly when the person has it on: LiveKit mutes the publication when it cannot restart
+    // a track, and a new track can come back disabled. Either would record silence for the rest of the meeting.
+    function syncMute() {
+      const t = micTrack(); if (!t) return;
+      if (mode === 'sfu' && lkRoom && window.LivekitClient) {
+        const pub = lkRoom.localParticipant.getTrackPublication(window.LivekitClient.Track.Source.Microphone);
+        if (pub && pub.track && micOn && pub.isMuted) { recNote('microphone was muted without you: unmuted'); pub.unmute().catch(() => {}); return; }
+      }
+      if (t.enabled !== micOn) { if (micOn) recNote('microphone was disabled without you: enabled'); t.enabled = micOn; }
+    }
+    let leaving = false;
+    setInterval(() => {             // watchdog
+      if (ended || leaving || !joined || R.restarting) return;
+      syncMute();
+      const cur = micTrack();
+      if (mode === 'sfu' && cur && !localStream.getAudioTracks().includes(cur)) {   // LiveKit brought a new track: keep the stream in step
+        localStream.getAudioTracks().forEach((o) => { if (o.readyState === 'ended') localStream.removeTrack(o); });
+        localStream.addTrack(cur);
+      }
+      if (R.state === 'none') { if (cur && window.MediaRecorder) restartSoon('a microphone is available'); return; }
+      if (!R.rec || R.rec.state === 'inactive') return restartSoon('the recorder was not running');
+      if (cur && cur !== R.track) return restartSoon('the microphone changed');
+      if (R.track && R.track.readyState === 'ended') return restartSoon('the microphone ended', 1500);
+      if (R.rec.state === 'paused') { try { R.rec.resume(); } catch { /* */ } }
+      if (micOn && Date.now() - R.lastChunk > 10_000) return restartSoon('no audio for 10 s');
+      setRec('on');
+    }, 2000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && R.rec && R.rec.state === 'inactive' && !ended) restartSoon('the tab came back'); });
     // Upload budget. Each browser encodes its camera once per other person, so the per-person bitrate falls as the
     // room grows: total upload stays around 2–3 Mbps. Audio (Opus) is never touched.
     function videoTier(n) {
@@ -375,7 +507,11 @@
           const moving = f > (pc._frames ?? -1) || a > (pc._audio ?? -1);
           pc._frames = f; pc._audio = a;
           if (moving) pc._still = 0; else if (++pc._still >= 3) { pc._still = 0; heal(id, 'frozen'); } }).catch(() => {}); }); }, 3500);
-    window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg, mode: () => mode, room: () => lkRoom, stats: () => sfuStats(), dropSocket: () => ws && ws.close() };   // diagnostics + load tests
+    window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg, mode: () => mode, room: () => lkRoom, stats: () => sfuStats(), dropSocket: () => ws && ws.close(),   // diagnostics + load tests
+      rec: () => ({ state: R.state, why: R.why, seg: R.seg, restarts: R.restarts, queued: R.out.length, lastChunkAgo: Date.now() - R.lastChunk, track: R.track && R.track.id, recorder: R.rec && R.rec.state, log: R.log.slice(-15) }),
+      endMic: () => { const t = micTrack(); if (t) { t.stop(); t.dispatchEvent(new Event('ended')); } return !!t; },   // a microphone that goes away
+      swapMic: () => reacquireMic('test swap').then((t) => !!t),                                                        // a switch of device
+      killRecorder: () => { if (R.rec) { R.rec.ondataavailable = null; R.rec.onstop = null; try { R.rec.stop(); } catch { /* */ } } } };   // a recorder that dies silently
     async function onSignal(from, name, data) {
       let pc = pcs.get(from);
       if (data.restart) { if (pc && pc._initiator && !pc._healing) heal(from, 'asked'); return; }
@@ -497,8 +633,10 @@
         : { type: 'join', room: roomId, name: myName, ...(WANT_MEDIA ? { media: WANT_MEDIA } : {}) });
       ws.onclose = () => {
         if (ended) return;
-        if (!joined || !resumeKey || wsTries >= 7) { cnt.textContent = 'disconnected — reload to rejoin'; return; }
-        if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch { /* */ } }
+        R.ready = false; setRec(R.state);
+        if (!joined || !resumeKey || wsTries >= 7) { cnt.textContent = 'disconnected — reload to rejoin'; stopRecorder(); return; }
+        // keep recording: the chunks wait and go into the same recording when the socket is back (if the server had
+        // confirmed it; otherwise a new recording starts)
         cnt.textContent = 'reconnecting…'; note('ws', 'closed, retry ' + (wsTries + 1));
         setTimeout(() => { if (!ended) connectWs(); }, [500, 1000, 2000, 3000, 4000, 5000, 5000][wsTries++]);
       };
@@ -507,15 +645,25 @@
     function onWsMessage(ev) { let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === 'welcome') {
         meetingId = m.meeting; resumeKey = m.resume || null; selfId = m.self; wsTries = 0; if (m.is_host) $('#endall').hidden = false;
-        if (m.resumed) {       // back in the same place: keep the pictures, restart the recording
-          note('ws', 'resumed'); startRecording(); updCnt();
+        if (m.resumed) {       // back in the same place: keep the pictures and the recording (same file on the server)
+          note('ws', 'resumed'); updCnt();
+          const firstStart = R.out.findIndex((x) => !(x instanceof ArrayBuffer) && x.type === 'rec-start');
+          if (R.seg) R.out.unshift({ type: 'rec-resume', seg: R.seg });
+          else if (firstStart > 0) { R.out.splice(0, firstStart); R.outBytes = R.out.reduce((n, x) => n + (x instanceof ArrayBuffer ? x.byteLength : 0), 0); }
+          else if (firstStart < 0) { R.out = []; R.outBytes = 0; }
+          const resumable = !!R.seg;
+          R.ready = true; flushRec();
+          if (firstStart < 0 && !resumable && R.state !== 'none') restartSoon('socket back, recording unconfirmed');
+          setRec(R.state);
           if (mode === 'sfu') { if (!lkRoom && m.sfu) startSfu(m.sfu); }
           else (m.peers || []).forEach((p) => { if (!pcs.has(p.id)) makePC(p.id, p.name, true); });
           return;
         }
-        joined = true;
+        joined = true; R.ready = true;
         if (m.media === 'sfu' && m.sfu) startSfu(m.sfu); else (m.peers || []).forEach((p) => makePC(p.id, p.name, true));
-        startRecording(); }
+        startRecording('join'); }
+      else if (m.type === 'rec-ok') { R.seg = m.seg; R.startPending = false; setRec(R.state); }
+      else if (m.type === 'rec-restart') { recNote('server asked to restart (' + (m.why || '') + ')'); R.seg = null; restartSoon('server: ' + (m.why || 'restart')); }
       else if (m.type === 'resume-failed') { ended = true; cleanup(); location.reload(); }
       else if (m.type === 'media-token') { if (mode === 'sfu' && !ended) startSfu({ url: m.url, token: m.token }); }
       else if (m.type === 'signal') { if (mode === 'mesh') onSignal(m.from, m.name, m.data); }
@@ -529,10 +677,10 @@
     let micOn = true, camOn = true;
     $('#mic').onclick = () => { micOn = !micOn; if (!sfuMute('audio', micOn)) localStream.getAudioTracks().forEach((t) => { t.enabled = micOn; }); $('#mic').classList.toggle('off', !micOn); $('#mic').setAttribute('aria-pressed', String(!micOn)); $('#mic').textContent = micOn ? '🎙️' : '🔇'; tile('self', undefined, !micOn); };
     $('#cam').onclick = () => { camOn = !camOn; if (!sfuMute('video', camOn)) localStream.getVideoTracks().forEach((t) => { t.enabled = camOn; }); $('#cam').classList.toggle('off', !camOn); $('#cam').setAttribute('aria-pressed', String(!camOn)); $('#cam').textContent = camOn ? '🎥' : '🚫'; };
-    $('#leave').onclick = async () => { await stopRecording(); wsSend({ type: 'leave' }); try { ws.close(); } catch { /* */ } ended = true; cleanup();
+    $('#leave').onclick = async () => { leaving = true; await stopRecording(); wsSend({ type: 'leave' }); try { ws.close(); } catch { /* */ } ended = true; cleanup();
       if (me.authenticated && meetingId) endedScreen('you left the meeting'); else location.href = '/'; };
-    $('#endall').onclick = async () => { if (!confirm('End the meeting for everyone? The recording is then transcribed.')) return; await stopRecording(); wsSend({ type: 'end-meeting' }); };
-    window.addEventListener('beforeunload', () => { try { if (rec && rec.state !== 'inactive') rec.stop(); wsSend({ type: 'leave' }); } catch { /* */ } });
+    $('#endall').onclick = async () => { if (!confirm('End the meeting for everyone? The recording is then transcribed.')) return; leaving = true; await stopRecording(); wsSend({ type: 'end-meeting' }); };
+    window.addEventListener('beforeunload', () => { try { if (R.rec && R.rec.state !== 'inactive') R.rec.stop(); wsSend({ type: 'leave' }); } catch { /* */ } });
   }
 
   async function boot() {

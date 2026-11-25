@@ -30,8 +30,20 @@ meeting links to it (and to its CRM customer).
   `cd /opt/mikeos-meetings && sed -i 's/^MEETINGS_MEDIA=.*/MEETINGS_MEDIA=mesh/' .env && docker compose --env-file .env up -d mikeos-meetings`
   (restarting ends meetings that are running), or for one meeting just send people `/r/<room>?media=mesh`.
 - Dropped sockets: a socket that closes without Leave keeps its place for 30 s (`RESUME_MS`); the browser reconnects
-  with the resume key from its welcome (same peer id, same LiveKit identity, recording restarts). Caddy on 242 and 114
+  with the resume key from its welcome (same peer id, same LiveKit identity; the browser keeps recording meanwhile and
+  sends the kept audio into the same segment with `rec-resume`). Caddy on 242 and 114
   has `stream_close_delay 12h` so config reloads (other sites) no longer cut meeting sockets.
+- Recording robustness (2026-11-25): a MediaRecorder dies silently when its microphone track ends or is swapped
+  (LiveKit re-acquires an ended mic itself and mutes the publication if that fails). The browser restarts its recorder
+  when the mic track changes/ends, the recorder stops, no chunk came for 10 s while unmuted, or the server sends
+  `rec-restart` (someone in the meeting with no audio for `NO_AUDIO_MS`=20 s; logged). In SFU mode it waits for
+  LiveKit's own restart before taking the mic, and keeps the mic on exactly when the person has it on. `●Rec` in the
+  call shows your own state (dashed = reconnecting / not recording). The server logs join/leave/drop/resume/restarts
+  per person. Live test: `scripts/live_rec_e2e.py` (3 Chromes on the SFU, ws drop, mute, mic switch, mic ended,
+  recorder death; then the meeting page right after the end).
+- Meeting page before it is done: `live` (running → "still going on"; ending → "Transcribing…"), `queued`/`processing`
+  ("Transcribing… (part n of N)", `progress` in the API), then the transcript appears without a reload. "No speech was
+  recorded" only when done with zero lines; failed shows the error. The Previous meetings list polls the same way.
 - Load test: `scripts/load_sfu.py` (same flags as `load_mesh.py`, plus `--tcp K` = TURN over TCP only).
 - Follow-up: TURN over TLS on 443 for strict corporate firewalls (needs Caddy layer4 or a second IP on 114).
 

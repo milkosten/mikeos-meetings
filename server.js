@@ -36,6 +36,9 @@ export function createApp(env = process.env, deps = {}) {
     GPU_TOKEN: env.GPU_OSMIKE_TOKEN || '',
     END_GRACE_MS: +(env.END_GRACE_MS || 45_000),
     RESUME_MS: +(env.RESUME_MS ?? 30_000),    // a dropped socket keeps its place this long (network blip, proxy reload)
+    // Recording watchdog: someone in the meeting whose audio has not arrived for this long is told to restart their recorder.
+    NO_AUDIO_MS: +(env.NO_AUDIO_MS || 20_000),
+    REC_CHECK_MS: +(env.REC_CHECK_MS || 5_000),
     PUBLIC_HOST: env.PUBLIC_HOST || 'meetings.osmike.com',
     SECURE: env.INSECURE_COOKIES !== '1',
     LIVEKIT_URL: (env.LIVEKIT_URL || '').replace(/\/$/, ''),
@@ -283,7 +286,8 @@ export function createApp(env = process.env, deps = {}) {
   const brief = (m, sub) => ({
     id: m.id, room: m.room, title: m.title || 'Meeting', started_at: m.started_at, ended_at: m.ended_at || null,
     duration_s: m.ended_at ? Math.round((m.ended_at - m.started_at) / 1000) : null, status: m.status, stage: m.stage || null,
-    people: people(m), language: m.language || null, is_host: m.host_sub === sub, has_summary: !!m.summary,
+    live_state: m.status === 'live' ? liveState(m) : null, progress: m.status === 'processing' && m.progress ? { ...m.progress } : null,
+    people: people(m), language: m.language || null, is_host: m.host_sub === sub, has_summary: !!m.summary, lines: (m.transcript || []).length,
     url: `https://${cfg.PUBLIC_HOST}/m/${m.id}`,
   });
   const full = (m, sub) => ({
@@ -292,13 +296,16 @@ export function createApp(env = process.env, deps = {}) {
     transcript: (m.transcript || []).map((l) => ({ at: l.at, end: l.end, speaker: l.speaker, text: l.text })), summary: m.summary || null,
     calendar: m.calendar ? { title: m.calendar.title, url: `https://calendar.osmike.com/e/${m.calendar.id}`, crm_url: m.calendar.crm_company ? `https://crm.osmike.com/c/${m.calendar.crm_company}` : null } : null,
   });
-  const visible = (sub) => store.allMeetings().filter((m) => m.status !== 'live' && m.status !== 'discarded' && canSee(m, sub)).sort((a, b) => b.started_at - a.started_at);
+  // 'running' = people are still in it; 'ending' = everyone has left, the meeting closes after END_GRACE_MS and is then
+  // transcribed. The page shows "Transcribing…" for both ending and queued/processing (never "No speech" before done).
+  const liveState = (m) => { const live = liveRooms.get(m.room); return live && live.meetingId === m.id && live.peers.size ? 'running' : 'ending'; };
+  const visible = (sub, withLive) => store.allMeetings().filter((m) => (withLive || m.status !== 'live') && m.status !== 'discarded' && canSee(m, sub)).sort((a, b) => b.started_at - a.started_at);
   const search = (list, q) => { q = String(q || '').trim().toLowerCase(); if (!q) return list;
     return list.filter((m) => (m.title || '').toLowerCase().includes(q) || (m.transcript || []).some((l) => l.text.toLowerCase().includes(q)) || people(m).some((p) => p.name.toLowerCase().includes(q))); };
 
   app.get('/api/past', auth, (req, res) => {
     res.set('Cache-Control', 'no-store');
-    res.json({ meetings: search(visible(req.s.user.sub), req.query.q).slice(0, 200).map((m) => brief(m, req.s.user.sub)) });
+    res.json({ meetings: search(visible(req.s.user.sub, true), req.query.q).slice(0, 200).map((m) => brief(m, req.s.user.sub)) });
   });
   app.get('/api/past/:id', auth, (req, res) => {
     res.set('Cache-Control', 'no-store');
@@ -380,15 +387,22 @@ export function createApp(env = process.env, deps = {}) {
   function closeRec(ws) {
     if (ws.rec) { try { ws.rec.stream.end(); } catch { /* */ } ws.rec = null; }
   }
+  function openRec(ws, m, seg) {
+    fs.mkdirSync(store.audioDir(m.id), { recursive: true, mode: 0o700 });
+    ws.rec = { seg, meeting: m, stream: fs.createWriteStream(path.join(store.audioDir(m.id), `${seg.id}.webm`), { flags: 'a', mode: 0o600 }) };
+    ws.lastAudioAt = Date.now(); ws.noRec = false;
+  }
 
   // dropped = the socket closed without a Leave (network blip, proxy reload, dead connection): the person keeps their
   // place for RESUME_MS and can come back with the resume key from their welcome (same peer id, same SFU identity).
   function leave(ws, dropped) {
     const roomId = ws.roomId;           // the Leave button clears ws.roomId right after this: the end timer must not read it later
     const live = liveRooms.get(roomId);
+    const wasRec = !!ws.rec;
     closeRec(ws);
     if (!live || live.peers.get(ws.peerId) !== ws) return;
     live.peers.delete(ws.peerId);
+    log('meeting', live.meetingId, dropped ? 'socket dropped' : 'left', ws.peerId, ws.name, wasRec ? '' : '(was not recording)');
     if (dropped && cfg.RESUME_MS > 0) {
       const pid = ws.peerId;
       clearTimeout(live.away.get(pid)?.timer);
@@ -462,7 +476,12 @@ export function createApp(env = process.env, deps = {}) {
           return;
         }
         if (msg.type === 'rec-start') return recStart(ws, msg);
+        if (msg.type === 'rec-resume') return recResume(ws, msg);
         if (msg.type === 'rec-stop') return closeRec(ws);
+        if (msg.type === 'rec-none') {      // this browser cannot record (no microphone / no MediaRecorder): stop asking it to
+          if (!ws.noRec) log('meeting', liveRooms.get(ws.roomId)?.meetingId, 'cannot record', ws.peerId, ws.name, String(msg.why || '').slice(0, 60));
+          ws.noRec = true; closeRec(ws); return;
+        }
         if (msg.type === 'end-meeting') {
           const live = liveRooms.get(ws.roomId), m = live && store.meeting(live.meetingId);
           if (m && ws.user && m.host_sub === ws.user.sub) endMeeting(ws.roomId, `ended by ${ws.user.name}`);
@@ -481,6 +500,7 @@ export function createApp(env = process.env, deps = {}) {
       }
       for (const [roomId, live] of liveRooms) { const m = store.meeting(live.meetingId); if (m && Date.now() - m.started_at > MAX_MEETING_MS) endMeeting(roomId, 'time limit (5 h)'); }
     }, 30_000).unref();
+    setInterval(recWatch, cfg.REC_CHECK_MS).unref();
     return wss;
   }
 
@@ -502,15 +522,16 @@ export function createApp(env = process.env, deps = {}) {
       if (!ok) return send(ws, { type: 'resume-failed' });
       clearTimeout(a.timer); live.away.delete(pid);
       clearTimeout(live.endTimer); live.endTimer = null;
-      ws.peerId = pid; ws.name = a.name; ws.roomId = roomId; ws.resumeKey = a.key;
+      ws.peerId = pid; ws.name = a.name; ws.roomId = roomId; ws.resumeKey = a.key; ws.joinedAt = Date.now();
       live.peers.set(pid, ws);
+      log('meeting', live.meetingId, 'resumed', pid, ws.name);
       const m = store.meeting(live.meetingId);
       send(ws, { type: 'welcome', resumed: true, self: pid, peers: [...live.peers.entries()].filter(([id]) => id !== pid).map(([id, o]) => ({ id, name: o.name })), name: ws.name,
         meeting: m.id, recorded: true, resume: ws.resumeKey, is_host: !!(ws.user && m.host_sub === ws.user.sub), host_name: m.host_name, media: live.media,
         ...(live.media === 'sfu' ? { sfu: sfuInfo(live, ws) } : {}) });
       return;
     }
-    ws.name = name; ws.roomId = roomId; ws.resumeKey = b64url(crypto.randomBytes(18));
+    ws.name = name; ws.roomId = roomId; ws.resumeKey = b64url(crypto.randomBytes(18)); ws.joinedAt = Date.now();
     if (!live) {     // the first person decides the media path for the whole meeting: never sfu and mesh in one room
       const want = msg.media === 'mesh' || msg.media === 'sfu' ? msg.media : cfg.MEDIA;
       live = { peers: new Map(), away: new Map(), meetingId: startMeeting(roomId).id, endTimer: null, media: want === 'sfu' && cfg.SFU_READY ? 'sfu' : 'mesh' };
@@ -525,22 +546,50 @@ export function createApp(env = process.env, deps = {}) {
       is_host: !!(ws.user && m.host_sub === ws.user.sub), host_name: m.host_name, media: live.media, ...(live.media === 'sfu' ? { sfu: sfuInfo(live, ws) } : {}) });
     for (const [, o] of live.peers) send(o, { type: 'peer-joined', id: ws.peerId, name });
     live.peers.set(ws.peerId, ws);
+    log('meeting', m.id, 'joined', ws.peerId, name, ws.user ? 'signed in' : 'guest', live.media);
   }
 
   function recStart(ws, msg) {
     const live = liveRooms.get(ws.roomId); if (!live) return;
     const m = store.meeting(live.meetingId); if (!m) return;
+    if (!live.peers.get(ws.peerId) || live.peers.get(ws.peerId) !== ws) return;
     closeRec(ws);
     const seg = { id: rid(12), pid: ws.peerId, name: ws.name, sub: ws.user?.sub || null, started_at: Date.now(), bytes: 0, mime: String(msg.mime || 'audio/webm').slice(0, 60) };
     m.segments.push(seg);
-    fs.mkdirSync(store.audioDir(m.id), { recursive: true, mode: 0o700 });
-    ws.rec = { seg, meeting: m, stream: fs.createWriteStream(path.join(store.audioDir(m.id), `${seg.id}.webm`), { flags: 'a', mode: 0o600 }) };
+    openRec(ws, m, seg);
     saveSoon(m);
+    const n = m.segments.filter((x) => x.pid === ws.peerId).length;
+    if (n > 1 || msg.why) log('meeting', m.id, 'recording', n > 1 ? `restarted (segment ${n})` : 'started', ws.peerId, ws.name, String(msg.why || '').slice(0, 60));
+    send(ws, { type: 'rec-ok', seg: seg.id });
+  }
+  // Back after a dropped socket: the browser kept recording into the same file and sends what it buffered meanwhile.
+  function recResume(ws, msg) {
+    const live = liveRooms.get(ws.roomId), m = live && store.meeting(live.meetingId);
+    const seg = m && live.peers.get(ws.peerId) === ws && m.segments.find((x) => x.id === String(msg.seg || '') && x.pid === ws.peerId);
+    if (!seg) { closeRec(ws); return send(ws, { type: 'rec-restart', why: 'unknown segment' }); }
+    closeRec(ws); openRec(ws, m, seg);
+    send(ws, { type: 'rec-ok', seg: seg.id, resumed: true });
   }
   function audioIn(ws, buf) {
     const r = ws.rec;
     if (!r || r.meeting.status !== 'live' || r.seg.bytes + buf.length > MAX_SEG_BYTES) return;
-    r.stream.write(buf); r.seg.bytes += buf.length; saveSoon(r.meeting);
+    r.stream.write(buf); r.seg.bytes += buf.length; ws.lastAudioAt = Date.now(); saveSoon(r.meeting);
+  }
+  // Someone is in the meeting but their audio is not arriving (recorder died, the microphone was swapped, a tab in the
+  // background): ask that browser to restart its recorder, at most once per NO_AUDIO_MS, and log it. Silence (muted)
+  // still arrives as audio, so a muted person is never asked.
+  function recWatch() {
+    const now = Date.now();
+    for (const [, live] of liveRooms) {
+      for (const [, ws] of live.peers) {
+        if (ws.noRec || now - (ws.joinedAt || now) < cfg.NO_AUDIO_MS) continue;
+        const since = ws.rec ? now - (ws.lastAudioAt || 0) : now - Math.max(ws.joinedAt || 0, ws.recAskedAt || 0);
+        if (since < cfg.NO_AUDIO_MS || now - (ws.recAskedAt || 0) < cfg.NO_AUDIO_MS) continue;
+        ws.recAskedAt = now;
+        log('meeting', live.meetingId, 'no audio for', Math.round(since / 1000), 's from', ws.peerId, ws.name, ws.rec ? '' : '(no recording open)', '-> asking to restart');
+        send(ws, { type: 'rec-restart', why: 'no audio' });
+      }
+    }
   }
 
   // ================= after the meeting: one job at a time =================

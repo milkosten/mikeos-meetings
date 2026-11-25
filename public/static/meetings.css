@@ -47,6 +47,16 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 .roomtop .brand { min-height:36px; } .grow { flex:1; }
 .rec { display:inline-flex; align-items:center; font-size:14px; font-weight:700; color:var(--site-stage-ink); border:1px solid var(--site-rec); border-radius:999px; padding:2px 10px 2px 8px; }
 .rec .ic { color:var(--site-rec); margin-right:4px; }
+/* own recording state: steady red = your microphone is being recorded; dim + dashed = reconnecting / not recording */
+.rec.on .ic { animation:recpulse 2s ease-in-out infinite; }
+.rec.warn { border-style:dashed; color:var(--site-stage-muted); }
+.rec.warn .ic { opacity:.55; }
+@keyframes recpulse { 50% { opacity:.35; } }
+@media (prefers-reduced-motion: reduce) { .rec.on .ic { animation:none; } }
+.notice.pending { display:flex; gap:10px; align-items:flex-start; }
+.spin { flex:none; width:16px; height:16px; margin-top:4px; border-radius:50%; border:2px solid currentColor; border-right-color:transparent; animation:spin 1s linear infinite; opacity:.7; }
+@keyframes spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
 .cnt { font-size:14px; color:var(--site-stage-muted); white-space:nowrap; }
 .btn.ghostdark { background:transparent; color:var(--site-stage-ink); border-color:var(--site-stage-line); min-height:38px; padding:6px 14px; font-size:15px; }
 @media (max-width:520px) { .hide-s { display:none; } .btn.ghostdark .ic { margin:0; } }

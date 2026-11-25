@@ -19,8 +19,18 @@ services:
       TURN_SECRET: ${TURN_SECRET}
       TURN_REALM: meetings.osmike.com
       COOKIE_SECRET: ${COOKIE_SECRET}
+      PUBLIC_HOST: meetings.osmike.com
+      DATA_DIR: /data
+      # After the meeting: speech to text (Whisper on the Kittelfjäll GPU, tunnel on the docker gateway) and the
+      # summary (Qwen on the same GPU via gpu.osmike.com). Both take the GPU token; it lives only in .env on 242.
+      STT_URL: http://172.18.0.1:21600
+      LLM_URL: https://gpu.osmike.com
+      LLM_MODEL: huihui_ai/qwen3-abliterated:8b-v2
+      GPU_OSMIKE_TOKEN: ${GPU_OSMIKE_TOKEN}
+    volumes:
+      - /data/meetings:/data          # RAID6 (recordings, transcripts, sessions) — never the NVMe root
     networks: [deploy_default]
-    mem_limit: 512m
+    mem_limit: 768m
     cpus: 1.0
 
   mikeos-meetings-turn:

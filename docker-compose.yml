@@ -14,7 +14,7 @@ services:
       ISSUER: https://account.osmike.com
       CLIENT_ID: meetings-web
       CALENDAR_URL: http://mikeos-events:8000
-      TURN_HOST: meetings.osmike.com
+      TURN_HOST: 144.76.45.114   # TURN runs on relay 114 (242 firewall blocks 3478/UDP), 2026-11-25
       TURN_PORT: "3478"
       TURN_SECRET: ${TURN_SECRET}
       TURN_REALM: meetings.osmike.com

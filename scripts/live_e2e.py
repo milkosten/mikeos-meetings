@@ -143,8 +143,10 @@ class Chrome:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--media", choices=["", "sfu", "mesh"], default="", help="force the media path (?media=); default: the server's")
     ap.add_argument("--shots", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "screens"))
     a = ap.parse_args()
+    mq = f"?media={a.media}" if a.media else ""
     os.makedirs(a.shots, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="meet-e2e-")
     shots = {}
@@ -170,7 +172,7 @@ def main():
         ca.call("Network.setCookie", name=SID, value=b4.sid(), url=SITE + "/", secure=True, httpOnly=True, sameSite="Lax", path="/")
         # guest: the join screen asks for a name and refuses an empty one
         cg.view(390, False)
-        cg.open(f"{SITE}/r/{rid}", "#joinf")
+        cg.open(f"{SITE}/r/{rid}{mq}", "#joinf")
         txt = cg.js("document.body.innerText")
         check("Your name" in txt and "recorded and transcribed" in txt, "guest join screen asks for a name and says the meeting is recorded")
         shots["join-guest-390-light"] = cg.shot(os.path.join(a.shots, "join-guest-390-light.png"))
@@ -179,7 +181,7 @@ def main():
         check("Type your name to join" in cg.js("document.body.innerText"), "empty name refused")
         cg.view(1280, False)
         ca.view(1280, False)
-        ca.open(f"{SITE}/r/{rid}", "#joinf")
+        ca.open(f"{SITE}/r/{rid}{mq}", "#joinf")
         check(f"You join as {me4['name']}" in ca.js("document.body.innerText"), "signed-in person joins with the account name, no name field")
         shots["join-signedin-1280-light"] = ca.shot(os.path.join(a.shots, "join-signedin-1280-light.png"))
         ca.js("document.querySelector('#joinf button[type=submit]').click()")
@@ -194,10 +196,23 @@ def main():
         names = ca.js("[...document.querySelectorAll('.tile .nm')].map(x=>x.textContent)")
         check(any("Gustav Gäst" in n for n in names), f"host sees the guest by name: {names}")
         check(not ca.js("document.querySelector('#endall').hidden") and cg.js("document.querySelector('#endall').hidden"), "only the host has End for all")
+        mode = ca.js("window.osmikeMeeting && window.osmikeMeeting.mode ? window.osmikeMeeting.mode() : 'mesh'")
+        print(f"media path: {mode}", flush=True)
+        if a.media:
+            check(mode == a.media and cg.js("window.osmikeMeeting.mode()") == a.media, f"both use the {a.media} path")
+        if mode == "sfu":
+            time.sleep(4)
+            st0 = ca.js("window.osmikeMeeting.stats()") or {}
+            check(any(r["frames"] > 0 for r in st0.get("remotes", [])), "host decodes the guest's video through the SFU")
         print("talking for 45 s ...", flush=True)
         time.sleep(20)
         shots["room-1280"] = ca.shot(os.path.join(a.shots, "room-1280.png"))
-        time.sleep(25)
+        # the guest's socket drops (no Leave): it must come back to the same place, the host never loses the guest
+        cg.js("window.osmikeMeeting.dropSocket()")
+        time.sleep(5)
+        check("in call" in cg.js("document.querySelector('#cnt').textContent") and any("Gustav Gäst" in n for n in ca.js("[...document.querySelectorAll('.tile .nm')].map(x=>x.textContent)")),
+              "a dropped socket resumes: guest back in the call, host still sees the guest")
+        time.sleep(20)
         ca.js("window.confirm=()=>true;document.querySelector('#endall').click()")
         time.sleep(4)
         check("meeting ended" in cg.js("document.body.innerText").lower(), "guest sees that the host ended the meeting")

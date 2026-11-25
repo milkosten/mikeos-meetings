@@ -41,7 +41,8 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 
 /* The call: a dark stage in both themes (video reads best on dark). */
 #app { flex:1; display:flex; flex-direction:column; min-height:0; }
-.room { flex:1; display:flex; flex-direction:column; background:var(--site-stage); color:var(--site-stage-ink); position:relative; min-height:100vh; min-height:100dvh; }
+.room { flex:1; display:flex; flex-direction:column; background:var(--site-stage); color:var(--site-stage-ink); position:relative; min-height:100vh; min-height:100dvh; height:100vh; height:100dvh; max-height:100vh; max-height:100dvh; }
+/* height + max-height (flex:1 ignores height), not only min-height: the stage must end at the window edge, so the fitted grid fits the window (else a big room grew below the fold and the SFU paused the pictures nobody could see) */
 .roomtop { display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--site-stage2); border-bottom:1px solid var(--site-stage-line); }
 .roomtop .brand { min-height:36px; } .grow { flex:1; }
 .rec { display:inline-flex; align-items:center; font-size:14px; font-weight:700; color:var(--site-stage-ink); border:1px solid var(--site-rec); border-radius:999px; padding:2px 10px 2px 8px; }
@@ -68,3 +69,10 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 .ctl.end { background:transparent; border:1px solid var(--site-rec); }
 .two > .stack, .two input { min-width:0; }
 .facts .tz { display:block; font-size:15px; }
+/* SFU path (LiveKit): many people — the stage scrolls instead of shrinking tiles below 160 px; who talks is outlined. */
+.stage { overflow-y:auto; }
+.tile.speaking { outline:3px solid var(--site-ok); outline-offset:-3px; }
+.tile.camoff video { visibility:hidden; }
+.tile.camoff::after { content:""; position:absolute; inset:0; margin:auto; width:28%; aspect-ratio:1; border-radius:50%; background:var(--site-stage-line); }
+.tile .lkaudio { display:none; }
+.soundbtn { position:absolute; left:50%; top:64px; transform:translateX(-50%); z-index:10; }

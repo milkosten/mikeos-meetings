@@ -203,3 +203,142 @@ test('pipeline helpers', async () => {
   assert.ok(calls.every((c) => c[1].content.length < 30000));
   assert.match(transcriptText({ started_at: 0, transcript: [{ at: 61000, speaker: 'A', text: 'hi' }] }), /^\[00:01:01\] A: hi$/);
 });
+
+// ================= SFU path (LiveKit): token per join, one media path per room, the socket stays the authority =================
+const LK = { LIVEKIT_URL: 'wss://lk.test', LIVEKIT_API_KEY: 'APItest', LIVEKIT_API_SECRET: 'secret-for-tests-only-0123456789abcdef' };
+const lkCalls = [];
+const lkFetch = async (url, opts = {}) => {
+  if (String(url).startsWith('https://lk.test/twirp/')) { lkCalls.push({ method: String(url).split('/').pop(), auth: opts.headers?.Authorization, body: JSON.parse(opts.body) }); return Response.json({}); }
+  return fakeFetch(url, opts);
+};
+const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-sfu-'));
+const M2 = createApp({ ...env, ...LK, DATA_DIR: dir2, MEETINGS_MEDIA: 'sfu' }, { fetch: lkFetch, stt, llm, log: () => {}, retryMs: 10 });
+const server2 = http.createServer(M2.app); M2.attach(server2);
+await new Promise((r) => server2.listen(0, '127.0.0.1', r));
+const base2 = `http://127.0.0.1:${server2.address().port}`;
+test.after(() => { server2.close(); fs.rmSync(dir2, { recursive: true, force: true }); });
+const ws2 = (c) => new Promise((res) => { const w = new WebSocket(base2.replace('http', 'ws') + '/ws', { headers: c ? { cookie: c.cookie } : {} });
+  w.msgs = []; w.on('message', (d, bin) => { if (!bin) w.msgs.push(JSON.parse(d)); }); w.on('open', () => res(w)); });
+function verifyJwt(tok, secret) {
+  const [h, p, sig] = tok.split('.');
+  assert.equal(JSON.parse(Buffer.from(h, 'base64url')).alg, 'HS256');
+  const want = (crypto => crypto.createHmac('sha256', secret).update(`${h}.${p}`).digest('base64url'))(globalThis.__crypto);
+  assert.equal(sig, want, 'signed with the API secret');
+  return JSON.parse(Buffer.from(p, 'base64url'));
+}
+globalThis.__crypto = (await import('node:crypto')).default;
+
+test('flag: no LiveKit keys means mesh, even with MEETINGS_MEDIA=sfu', async () => {
+  const M3 = createApp({ ...env, DATA_DIR: dir2, MEETINGS_MEDIA: 'sfu' }, { fetch: fakeFetch, stt, llm, log: () => {} });
+  assert.equal(M3.cfg.SFU_READY, false);
+  assert.equal(M.cfg.MEDIA, 'mesh', 'the default stays mesh');
+  assert.equal((await (await realFetch(`${base}/api/room/abc`)).json()).media, 'mesh');
+  assert.equal((await (await realFetch(`${base2}/api/room/abc`)).json()).media, 'sfu');
+  assert.equal((await (await realFetch(`${base2}/healthz`)).json()).media, 'sfu');
+});
+
+test('SFU: a short-lived token per join (identity = peer id, name decided by the server, room = the meeting)', async () => {
+  // M2 logins go through M2's own routes
+  const login2 = async (code) => {
+    let r = await realFetch(`${base2}/auth/login`, { redirect: 'manual' });
+    const pre = jar(r.headers).find((c) => c.startsWith('meetings-pre='));
+    const state = new URL(r.headers.get('location')).searchParams.get('state');
+    r = await realFetch(`${base2}/auth/callback?code=${code}&state=${state}`, { redirect: 'manual', headers: { cookie: pre } });
+    return { cookie: jar(r.headers).find((c) => c.startsWith('meetings-sid=')) };
+  };
+  const A2 = await login2('codeA');
+  const host = await ws2(A2); host.send(JSON.stringify({ type: 'join', room: 'sfuRoom', name: 'x' }));
+  const wel = await waitFor(() => host.msgs.find((m) => m.type === 'welcome'));
+  assert.equal(wel.media, 'sfu'); assert.equal(wel.sfu.url, 'wss://lk.test');
+  const c = verifyJwt(wel.sfu.token, LK.LIVEKIT_API_SECRET);
+  assert.equal(c.iss, 'APItest'); assert.equal(c.sub, wel.self); assert.equal(c.name, 'Anna Andersson');
+  assert.equal(c.video.room, wel.meeting); assert.equal(c.video.roomJoin, true); assert.equal(c.video.canPublish, true);
+  assert.ok(!c.video.roomAdmin, 'participants never get admin rights');
+  assert.ok(c.exp - Math.floor(Date.now() / 1000) <= 600 && c.exp > c.nbf);
+  const g = await ws2(null); g.send(JSON.stringify({ type: 'join', room: 'sfuRoom', name: ' Gäst <b>Gustav ', media: 'mesh' }));
+  const gw = await waitFor(() => g.msgs.find((m) => m.type === 'welcome'));
+  assert.equal(gw.media, 'sfu', 'a later joiner cannot switch the room to mesh');
+  const gc = verifyJwt(gw.sfu.token, LK.LIVEKIT_API_SECRET);
+  assert.equal(gc.name, 'Gäst bGustav'); assert.equal(gc.video.room, wel.meeting); assert.notEqual(gc.sub, c.sub);
+  // a fresh token for reconnecting, only for someone in the meeting
+  g.send(JSON.stringify({ type: 'media-token' }));
+  const mt = await waitFor(() => g.msgs.find((m) => m.type === 'media-token'));
+  assert.equal(verifyJwt(mt.token, LK.LIVEKIT_API_SECRET).sub, gw.self);
+  const stranger = await ws2(null); stranger.send(JSON.stringify({ type: 'media-token' }));
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(stranger.msgs.length, 0); stranger.close();
+  // recording still goes over the socket in an SFU room
+  host.send(JSON.stringify({ type: 'rec-start', mime: 'audio/webm' })); await new Promise((r) => setTimeout(r, 30));
+  await sendFile(host, wav);
+  await new Promise((r) => setTimeout(r, 100));
+  g.send(JSON.stringify({ type: 'leave' }));
+  await waitFor(() => lkCalls.find((x) => x.method === 'RemoveParticipant' && x.body.identity === gw.self));
+  const adm = verifyJwt(lkCalls.find((x) => x.method === 'RemoveParticipant').auth.slice(7), LK.LIVEKIT_API_SECRET);
+  assert.equal(adm.video.roomAdmin, true); assert.equal(adm.video.room, wel.meeting);
+  host.send(JSON.stringify({ type: 'end-meeting' }));
+  await waitFor(() => lkCalls.find((x) => x.method === 'DeleteRoom' && x.body.room === wel.meeting));
+  const m = await waitFor(() => { const x = M2.store.meeting(wel.meeting); return x && x.status === 'done' ? x : null; });
+  assert.ok(m.transcript.length >= 1); assert.equal(m.transcript[0].speaker, 'Anna Andersson');
+  host.close(); g.close();
+});
+
+test('SFU server, ?media=mesh for one room: the whole room stays mesh (no tokens)', async () => {
+  const a = await ws2(null); a.send(JSON.stringify({ type: 'join', room: 'meshRoom', name: 'Ett', media: 'mesh' }));
+  const w1 = await waitFor(() => a.msgs.find((m) => m.type === 'welcome'));
+  assert.equal(w1.media, 'mesh'); assert.equal(w1.sfu, undefined);
+  const b = await ws2(null); b.send(JSON.stringify({ type: 'join', room: 'meshRoom', name: 'Två', media: 'sfu' }));
+  const w2 = await waitFor(() => b.msgs.find((m) => m.type === 'welcome'));
+  assert.equal(w2.media, 'mesh'); assert.equal(w2.sfu, undefined);
+  assert.equal((await (await realFetch(`${base2}/api/room/meshRoom`)).json()).media, 'mesh');
+  const n = lkCalls.length; a.close(); b.close();
+  await waitFor(() => !M2.liveRooms.has('meshRoom'));
+  assert.equal(lkCalls.length, n, 'a mesh room never calls LiveKit');
+});
+
+test('a dropped socket resumes the same place (same peer id, no peer-left, a new recording segment)', async () => {
+  const a = await ws2(null); a.send(JSON.stringify({ type: 'join', room: 'resumeRoom', name: 'Ada' }));
+  const wa = await waitFor(() => a.msgs.find((m) => m.type === 'welcome'));
+  const b = await ws2(null); b.send(JSON.stringify({ type: 'join', room: 'resumeRoom', name: 'Bea' }));
+  const wb = await waitFor(() => b.msgs.find((m) => m.type === 'welcome'));
+  assert.ok(wb.resume && wb.resume.length >= 20);
+  b.terminate();                                         // no Leave: the network dropped
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(!a.msgs.some((m) => m.type === 'peer-left'), 'the others are not told while the place is held');
+  // a wrong key does not take the place
+  const x = await ws2(null); x.send(JSON.stringify({ type: 'join', room: 'resumeRoom', name: 'Bea', resume: 'x'.repeat(wb.resume.length), pid: wb.self }));
+  await waitFor(() => x.msgs.find((m) => m.type === 'resume-failed')); x.close();
+  const b2 = await ws2(null); b2.send(JSON.stringify({ type: 'join', room: 'resumeRoom', name: 'Bea', resume: wb.resume, pid: wb.self }));
+  const w2 = await waitFor(() => b2.msgs.find((m) => m.type === 'welcome'));
+  assert.equal(w2.resumed, true); assert.equal(w2.self, wb.self); assert.equal(w2.meeting, wa.meeting); assert.equal(w2.media, 'sfu');
+  assert.equal(verifyJwt(w2.sfu.token, LK.LIVEKIT_API_SECRET).sub, wb.self, 'same SFU identity');
+  assert.ok(!lkCalls.some((c) => c.method === 'RemoveParticipant' && c.body.identity === wb.self), 'not removed from the SFU');
+  const m = M2.store.meeting(wa.meeting);
+  assert.equal(m.participants.filter((p) => p.name === 'Bea').length, 1); assert.equal(m.participants.find((p) => p.name === 'Bea').left_at, null);
+  // the resumed socket can end, leave and get tokens like before
+  b2.send(JSON.stringify({ type: 'media-token' })); await waitFor(() => b2.msgs.find((m) => m.type === 'media-token'));
+  b2.send(JSON.stringify({ type: 'leave' }));
+  await waitFor(() => a.msgs.find((m) => m.type === 'peer-left' && m.id === wb.self));
+  a.close(); b2.close();
+  await waitFor(() => !M2.liveRooms.has('resumeRoom'));
+});
+
+test('a dropped socket that does not come back is gone after the hold; resuming an ended meeting says ended', async () => {
+  const M4dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-res-'));
+  const M4 = createApp({ ...env, ...LK, DATA_DIR: M4dir, MEETINGS_MEDIA: 'sfu', RESUME_MS: '120', END_GRACE_MS: '400' }, { fetch: lkFetch, stt, llm, log: () => {} });
+  const s4 = http.createServer(M4.app); M4.attach(s4); await new Promise((r) => s4.listen(0, '127.0.0.1', r));
+  const u = `ws://127.0.0.1:${s4.address().port}/ws`;
+  const o = () => new Promise((res) => { const w = new WebSocket(u); w.msgs = []; w.on('message', (d, bin) => { if (!bin) w.msgs.push(JSON.parse(d)); }); w.on('open', () => res(w)); });
+  const a = await o(); a.send(JSON.stringify({ type: 'join', room: 'holdRoom', name: 'Ada' })); await waitFor(() => a.msgs.find((m) => m.type === 'welcome'));
+  const b = await o(); b.send(JSON.stringify({ type: 'join', room: 'holdRoom', name: 'Bea' })); const wb = await waitFor(() => b.msgs.find((m) => m.type === 'welcome'));
+  b.terminate();
+  await waitFor(() => a.msgs.find((m) => m.type === 'peer-left' && m.id === wb.self));
+  await waitFor(() => lkCalls.find((c) => c.method === 'RemoveParticipant' && c.body.identity === wb.self));
+  const late = await o(); late.send(JSON.stringify({ type: 'join', room: 'holdRoom', name: 'Bea', resume: wb.resume, pid: wb.self }));
+  await waitFor(() => late.msgs.find((m) => m.type === 'resume-failed')); late.close();
+  a.terminate();
+  await waitFor(() => !M4.liveRooms.has('holdRoom'));
+  const gone = await o(); gone.send(JSON.stringify({ type: 'join', room: 'holdRoom', name: 'Ada', resume: 'k', pid: 'p' }));
+  assert.equal((await waitFor(() => gone.msgs.find((m) => m.type === 'ended'))).type, 'ended');
+  assert.ok(!M4.liveRooms.has('holdRoom'), 'a resume never starts a new meeting');
+  gone.close(); s4.close(); fs.rmSync(M4dir, { recursive: true, force: true });
+});

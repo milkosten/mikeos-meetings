@@ -11,6 +11,30 @@ outside AI service. Visible only to the host and the signed-in people who were i
 guests keeps nothing. Guests (no account) type their name before joining. If the room is on a calendar event, the
 meeting links to it (and to its CRM customer).
 
+## Media paths: SFU (LiveKit) and mesh (2026-11-25)
+- **SFU** — LiveKit `livekit/livekit-server:v1.13.11` (Apache-2.0) on **relay 114** (`osmike-livekit`, host network,
+  `/opt/osmike-livekit/{livekit.yaml,run.sh,.env}`; copies in `ops/livekit-114.*`). Signaling `wss://livekit.osmike.com`
+  (114 Caddy → `172.17.0.1:7880`), media **UDP 7882** (one port, all participants) + **TCP 7881** fallback, plus our
+  coturn on 114 as TURN (the browser gets `/api/ice`). No participant ceiling. Each browser uploads ONE camera stream as
+  simulcast (180p/360p/540p); LiveKit forwards to everyone the layer that fits (adaptiveStream + dynacast).
+  Client: `public/static/vendor/livekit-client-2.23.0.umd.js` (pinned, vendored, loaded only for SFU rooms).
+- **Mesh** — the old peer-to-peer path (good for 2–6).
+- The `/ws` socket stays the authority on both paths: presence, names, per-browser recording, end of meeting. On the
+  SFU path the server mints a short-lived LiveKit token in `welcome` (identity = peer id, name = account name or the
+  guest's typed name, room = the meeting id), removes a person from LiveKit when their socket leaves and deletes the
+  LiveKit room when the meeting ends. Keys: secretz `livekit-api-key` / `livekit-api-secret`, `.env` on 242
+  (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`).
+- **Flag:** `MEETINGS_MEDIA=sfu|mesh` (compose, from `.env`) picks the path for new rooms; the first person in a room
+  decides and everyone in that meeting uses the same path. `/r/<room>?media=mesh|sfu` overrides it for one room
+  (tests). Without LiveKit keys every room is mesh. **Way back to mesh:** on 242
+  `cd /opt/mikeos-meetings && sed -i 's/^MEETINGS_MEDIA=.*/MEETINGS_MEDIA=mesh/' .env && docker compose --env-file .env up -d mikeos-meetings`
+  (restarting ends meetings that are running), or for one meeting just send people `/r/<room>?media=mesh`.
+- Dropped sockets: a socket that closes without Leave keeps its place for 30 s (`RESUME_MS`); the browser reconnects
+  with the resume key from its welcome (same peer id, same LiveKit identity, recording restarts). Caddy on 242 and 114
+  has `stream_close_delay 12h` so config reloads (other sites) no longer cut meeting sockets.
+- Load test: `scripts/load_sfu.py` (same flags as `load_mesh.py`, plus `--tcp K` = TURN over TCP only).
+- Follow-up: TURN over TLS on 443 for strict corporate firewalls (needs Caddy layer4 or a second IP on 114).
+
 ## Link formats
 - `https://meetings.osmike.com/r/<room>` — join (guests type a name)
 - `https://meetings.osmike.com/m/<meeting>` — notes of one past meeting (participants only)
@@ -23,7 +47,7 @@ meeting links to it (and to its CRM customer).
 - Agents: `osmike-meetings past|notes ID|transcript ID` (osmike-cli) → osmike-runs `/v1/runs/meetings/past` →
   `/api/agent/meetings` here with the person's account token.
 
-Real-time video meetings for MikeOS. WebRTC **mesh** (peer-to-peer, good for 2–6),
+Real-time video meetings for MikeOS. LiveKit **SFU** or WebRTC **mesh** (see Media paths above),
 same-origin **WebSocket signaling**, self-hosted **STUN/TURN (coturn)** — zero Google,
 zero paid services, zero CDNs. Sign in with a MikeOS Account (OAuth2 Auth-Code+PKCE
 against account.osmike.com). Scheduled meetings are written to the MikeOS-native

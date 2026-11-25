@@ -1,6 +1,8 @@
 // OsMike Meetings — meetings.osmike.com
-// Video meetings: WebRTC mesh (peer-to-peer, good for 2-6), same-origin WebSocket signaling, self-hosted STUN/TURN
-// (coturn). Sign in with an OsMike Account (OAuth 2.0 code + PKCE against account.osmike.com, server-side session,
+// Video meetings, two media paths (MEETINGS_MEDIA=sfu|mesh, per room ?media=): the LiveKit SFU on relay 114
+// (livekit.osmike.com, no participant ceiling; the server mints a short-lived token per join) or the WebRTC mesh
+// (peer-to-peer, good for 2-6). Either way the same-origin /ws socket carries presence, recording and the meeting's
+// lifecycle; only the audio/video goes through LiveKit. Self-hosted STUN/TURN (coturn on 114) for strict networks. Sign in with an OsMike Account (OAuth 2.0 code + PKCE against account.osmike.com, server-side session,
 // identity from /oauth/userinfo — account issues no id_token). People without an account join a room link by typing
 // their name.
 //
@@ -33,9 +35,17 @@ export function createApp(env = process.env, deps = {}) {
     LLM_MODEL: env.LLM_MODEL || 'huihui_ai/qwen3-abliterated:8b-v2',
     GPU_TOKEN: env.GPU_OSMIKE_TOKEN || '',
     END_GRACE_MS: +(env.END_GRACE_MS || 45_000),
+    RESUME_MS: +(env.RESUME_MS ?? 30_000),    // a dropped socket keeps its place this long (network blip, proxy reload)
     PUBLIC_HOST: env.PUBLIC_HOST || 'meetings.osmike.com',
     SECURE: env.INSECURE_COOKIES !== '1',
+    LIVEKIT_URL: (env.LIVEKIT_URL || '').replace(/\/$/, ''),
+    LIVEKIT_API_KEY: env.LIVEKIT_API_KEY || '',
+    LIVEKIT_API_SECRET: env.LIVEKIT_API_SECRET || '',
+    MEDIA: env.MEETINGS_MEDIA === 'sfu' ? 'sfu' : 'mesh',   // default for new rooms; the way back is MEETINGS_MEDIA=mesh
+    LK_TOKEN_TTL_S: +(env.LK_TOKEN_TTL_S || 600),
   };
+  cfg.SFU_READY = !!(cfg.LIVEKIT_URL && cfg.LIVEKIT_API_KEY && cfg.LIVEKIT_API_SECRET);
+  cfg.LIVEKIT_HTTP = cfg.LIVEKIT_URL.replace(/^ws/, 'http');
   const store = deps.store || new Store(cfg.DATA_DIR);
   const fetchImpl = deps.fetch || fetch;
   const log = deps.log || ((...a) => console.log(new Date().toISOString(), ...a));
@@ -178,6 +188,32 @@ export function createApp(env = process.env, deps = {}) {
   }
   app.get('/api/ice', (req, res) => res.json({ iceServers: iceServers() }));
 
+  // ================= LiveKit (SFU) =================
+  // Access token = HS256 JWT signed with the API secret. identity = the socket's peerId (so the server can remove that
+  // exact person), name = the name the server already decided (account name or the guest's typed name), room = the
+  // meeting id (a token for one meeting never opens the next meeting in the same room).
+  const jwt = (claims) => {
+    const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const body = `${enc({ alg: 'HS256', typ: 'JWT' })}.${enc(claims)}`;
+    return `${body}.${crypto.createHmac('sha256', cfg.LIVEKIT_API_SECRET).update(body).digest('base64url')}`;
+  };
+  function lkToken(room, identity, name, ttl = cfg.LK_TOKEN_TTL_S) {
+    const now = Math.floor(Date.now() / 1000);
+    return jwt({ iss: cfg.LIVEKIT_API_KEY, sub: identity, name, nbf: now - 10, exp: now + ttl, jti: identity + '-' + rid(6),
+      video: { room, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: false, canUpdateOwnMetadata: false } });
+  }
+  async function lkAdmin(method, body) {     // best effort: the /ws socket stays the authority on who is in the meeting
+    if (!cfg.SFU_READY) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const tok = jwt({ iss: cfg.LIVEKIT_API_KEY, sub: 'meetings-server', nbf: now - 10, exp: now + 60, video: { room: body.room, roomAdmin: true, roomCreate: true } });
+    try {
+      const r = await fetchImpl(`${cfg.LIVEKIT_HTTP}/twirp/livekit.RoomService/${method}`, { method: 'POST',
+        headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+      return r.status;
+    } catch (e) { log('livekit', method, e.message); return null; }
+  }
+  const sfuInfo = (live, ws) => ({ url: cfg.LIVEKIT_URL, token: lkToken(live.meetingId, ws.peerId, ws.name) });
+
   // ================= rooms + calendar =================
   const newRoomId = () => rid(10);
   const joinUrl = (roomId) => `https://${cfg.PUBLIC_HOST}/r/${roomId}`;
@@ -238,7 +274,8 @@ export function createApp(env = process.env, deps = {}) {
     const id = String(req.params.id);
     if (!/^[A-Za-z0-9]{1,64}$/.test(id)) return res.status(404).json({ error: 'not_found' });
     const live = liveRooms.get(id), r = store.room(id);
-    res.json({ recorded: true, title: r?.title || null, host_name: r?.host_name || null, in_call: live ? live.peers.size : 0 });
+    res.json({ recorded: true, title: r?.title || null, host_name: r?.host_name || null, in_call: live ? live.peers.size : 0,
+      media: live ? live.media : cfg.SFU_READY ? cfg.MEDIA : 'mesh' });
   });
 
   // ================= past meetings (host + signed-in participants only; everyone else: 404) =================
@@ -307,7 +344,8 @@ export function createApp(env = process.env, deps = {}) {
     res.json(full(m, sub));
   });
 
-  app.get('/healthz', (req, res) => res.json({ ok: true, queue: queue.length, busy: !!working, live: liveRooms.size }));
+  app.get('/healthz', (req, res) => res.json({ ok: true, queue: queue.length, busy: !!working, live: liveRooms.size,
+    media: cfg.SFU_READY ? cfg.MEDIA : 'mesh', sfu: cfg.SFU_READY }));
 
   // ================= pages =================
   const STATIC = path.join(path.dirname(new URL(import.meta.url).pathname), 'public');
@@ -324,7 +362,7 @@ export function createApp(env = process.env, deps = {}) {
   app.use((req, res) => (req.path.startsWith('/api/') ? res.status(404).json({ error: 'not_found' }) : index(res, 404)));
 
   // ================= live meetings: signaling + recording =================
-  const liveRooms = new Map(); // roomId -> { peers: Map<peerId, ws>, meetingId, endTimer }
+  const liveRooms = new Map(); // roomId -> { peers: Map<peerId, ws>, meetingId, endTimer, media: 'sfu'|'mesh' }
   const saveTimers = new Map();
   const saveSoon = (m) => { if (saveTimers.has(m.id)) return; saveTimers.set(m.id, setTimeout(() => { saveTimers.delete(m.id); store.saveMeeting(m); }, 5000)); };
   const send = (ws, obj) => { try { ws.send(JSON.stringify(obj)); } catch { /* gone */ } };
@@ -343,28 +381,40 @@ export function createApp(env = process.env, deps = {}) {
     if (ws.rec) { try { ws.rec.stream.end(); } catch { /* */ } ws.rec = null; }
   }
 
-  function leave(ws) {
+  // dropped = the socket closed without a Leave (network blip, proxy reload, dead connection): the person keeps their
+  // place for RESUME_MS and can come back with the resume key from their welcome (same peer id, same SFU identity).
+  function leave(ws, dropped) {
     const roomId = ws.roomId;           // the Leave button clears ws.roomId right after this: the end timer must not read it later
     const live = liveRooms.get(roomId);
     closeRec(ws);
-    if (!live || !live.peers.has(ws.peerId)) return;
+    if (!live || live.peers.get(ws.peerId) !== ws) return;
     live.peers.delete(ws.peerId);
-    const m = store.meeting(live.meetingId);
-    const p = m?.participants.find((x) => x.pid === ws.peerId);
-    if (p) { p.left_at = Date.now(); saveSoon(m); }
-    for (const [, o] of live.peers) send(o, { type: 'peer-left', id: ws.peerId });
+    if (dropped && cfg.RESUME_MS > 0) {
+      const pid = ws.peerId;
+      clearTimeout(live.away.get(pid)?.timer);
+      live.away.set(pid, { key: ws.resumeKey, name: ws.name, user: ws.user, timer: setTimeout(() => { if (live.away.delete(pid)) gone(live, pid); }, cfg.RESUME_MS) });
+    } else gone(live, ws.peerId);
     if (live.peers.size === 0) {
       clearTimeout(live.endTimer);
       live.endTimer = setTimeout(() => endMeeting(roomId, 'everyone left'), cfg.END_GRACE_MS);
     }
+  }
+  function gone(live, pid) {
+    const m = store.meeting(live.meetingId);
+    const p = m?.participants.find((x) => x.pid === pid && !x.left_at);
+    if (p) { p.left_at = Date.now(); saveSoon(m); }
+    for (const [, o] of live.peers) send(o, { type: 'peer-left', id: pid });
+    if (live.media === 'sfu') lkAdmin('RemoveParticipant', { room: live.meetingId, identity: pid });   // no ghost left in the SFU
   }
 
   function endMeeting(roomId, why) {
     const live = liveRooms.get(roomId);
     if (!live) return;
     clearTimeout(live.endTimer);
+    for (const [, a] of live.away) clearTimeout(a.timer);
     liveRooms.delete(roomId);
     for (const [, o] of live.peers) { send(o, { type: 'ended', by: why }); closeRec(o); o.roomId = null; try { o.close(); } catch { /* */ } }
+    if (live.media === 'sfu') lkAdmin('DeleteRoom', { room: live.meetingId });   // everyone out of the SFU too
     const m = store.meeting(live.meetingId);
     if (!m) return;
     finish(m, why);
@@ -406,6 +456,11 @@ export function createApp(env = process.env, deps = {}) {
           if (t) send(t, { type: 'signal', from: ws.peerId, name: ws.name, data: msg.data });
           return;
         }
+        if (msg.type === 'media-token') {        // SFU: a fresh token to reconnect (only for someone in the meeting)
+          const live = liveRooms.get(ws.roomId);
+          if (live && live.media === 'sfu' && live.peers.get(ws.peerId) === ws) send(ws, { type: 'media-token', ...sfuInfo(live, ws) });
+          return;
+        }
         if (msg.type === 'rec-start') return recStart(ws, msg);
         if (msg.type === 'rec-stop') return closeRec(ws);
         if (msg.type === 'end-meeting') {
@@ -416,12 +471,12 @@ export function createApp(env = process.env, deps = {}) {
         }
         if (msg.type === 'leave') { leave(ws); ws.roomId = null; }
       });
-      ws.on('close', () => leave(ws));
-      ws.on('error', () => leave(ws));
+      ws.on('close', () => leave(ws, true));
+      ws.on('error', () => leave(ws, true));
     });
     setInterval(() => {
       for (const ws of wss.clients) {
-        if (ws.isAlive === false) { leave(ws); ws.terminate(); continue; }
+        if (ws.isAlive === false) { leave(ws, true); ws.terminate(); continue; }
         ws.isAlive = false; try { ws.ping(); } catch { /* */ }
       }
       for (const [roomId, live] of liveRooms) { const m = store.meeting(live.meetingId); if (m && Date.now() - m.started_at > MAX_MEETING_MS) endMeeting(roomId, 'time limit (5 h)'); }
@@ -438,16 +493,36 @@ export function createApp(env = process.env, deps = {}) {
       name = String(msg.name || '').replace(/[\x00-\x1f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
       if (!name) return send(ws, { type: 'error', error: 'name_required' });
     }
-    ws.name = name; ws.roomId = roomId;
     let live = liveRooms.get(roomId);
-    if (!live) { live = { peers: new Map(), meetingId: startMeeting(roomId).id, endTimer: null }; liveRooms.set(roomId, live); }
+    if (msg.resume) {        // coming back after a dropped socket: same place, same peer id; never a new meeting
+      if (!live) return send(ws, { type: 'ended', by: '' });
+      const pid = String(msg.pid || ''), a = live.away.get(pid);
+      const ok = a && typeof msg.resume === 'string' && msg.resume.length === a.key.length && crypto.timingSafeEqual(Buffer.from(msg.resume), Buffer.from(a.key))
+        && (a.user?.sub || null) === (ws.user?.sub || null);
+      if (!ok) return send(ws, { type: 'resume-failed' });
+      clearTimeout(a.timer); live.away.delete(pid);
+      clearTimeout(live.endTimer); live.endTimer = null;
+      ws.peerId = pid; ws.name = a.name; ws.roomId = roomId; ws.resumeKey = a.key;
+      live.peers.set(pid, ws);
+      const m = store.meeting(live.meetingId);
+      send(ws, { type: 'welcome', resumed: true, self: pid, peers: [...live.peers.entries()].filter(([id]) => id !== pid).map(([id, o]) => ({ id, name: o.name })), name: ws.name,
+        meeting: m.id, recorded: true, resume: ws.resumeKey, is_host: !!(ws.user && m.host_sub === ws.user.sub), host_name: m.host_name, media: live.media,
+        ...(live.media === 'sfu' ? { sfu: sfuInfo(live, ws) } : {}) });
+      return;
+    }
+    ws.name = name; ws.roomId = roomId; ws.resumeKey = b64url(crypto.randomBytes(18));
+    if (!live) {     // the first person decides the media path for the whole meeting: never sfu and mesh in one room
+      const want = msg.media === 'mesh' || msg.media === 'sfu' ? msg.media : cfg.MEDIA;
+      live = { peers: new Map(), away: new Map(), meetingId: startMeeting(roomId).id, endTimer: null, media: want === 'sfu' && cfg.SFU_READY ? 'sfu' : 'mesh' };
+      liveRooms.set(roomId, live);
+    }
     clearTimeout(live.endTimer); live.endTimer = null;
     const m = store.meeting(live.meetingId);
     if (ws.user && !m.host_sub && !store.room(roomId)?.host_sub) { /* first signed-in person hosts an unregistered room */ m.host_sub = ws.user.sub; m.host_name = ws.user.name; }
     m.participants.push({ pid: ws.peerId, name, sub: ws.user?.sub || null, email: ws.user?.email || null, joined_at: Date.now(), left_at: null });
     store.saveMeeting(m);
-    send(ws, { type: 'welcome', self: ws.peerId, peers: [...live.peers.entries()].map(([id, o]) => ({ id, name: o.name })), name, meeting: m.id, recorded: true,
-      is_host: !!(ws.user && m.host_sub === ws.user.sub), host_name: m.host_name });
+    send(ws, { type: 'welcome', self: ws.peerId, peers: [...live.peers.entries()].map(([id, o]) => ({ id, name: o.name })), name, meeting: m.id, recorded: true, resume: ws.resumeKey,
+      is_host: !!(ws.user && m.host_sub === ws.user.sub), host_name: m.host_name, media: live.media, ...(live.media === 'sfu' ? { sfu: sfuInfo(live, ws) } : {}) });
     for (const [, o] of live.peers) send(o, { type: 'peer-joined', id: ws.peerId, name });
     live.peers.set(ws.peerId, ws);
   }
@@ -523,7 +598,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const server = http.createServer(app);
   attach(server);
   recover();
-  server.listen(cfg.PORT, () => console.log(`mikeos-meetings on :${cfg.PORT} (data ${cfg.DATA_DIR}, stt ${cfg.STT_URL}, llm ${cfg.LLM_URL}, gpu token ${cfg.GPU_TOKEN ? 'set' : 'MISSING'}, turn ${cfg.TURN_SECRET ? 'on' : 'stun-only'})`));
+  server.listen(cfg.PORT, () => console.log(`mikeos-meetings on :${cfg.PORT} (data ${cfg.DATA_DIR}, stt ${cfg.STT_URL}, llm ${cfg.LLM_URL}, gpu token ${cfg.GPU_TOKEN ? 'set' : 'MISSING'}, turn ${cfg.TURN_SECRET ? 'on' : 'stun-only'}, media ${cfg.SFU_READY ? cfg.MEDIA : 'mesh (no LiveKit keys)'})`));
   const bye = () => { try { store.flush(); } catch { /* */ } process.exit(0); };
   process.on('SIGTERM', bye); process.on('SIGINT', bye);
 }

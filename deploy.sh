@@ -31,7 +31,10 @@ if ! grep -q "^meetings.osmike.com {" "${CADDYFILE}"; then
 
 meetings.osmike.com {
 	encode zstd gzip
-	reverse_proxy mikeos-meetings:8095
+	# keep the meeting sockets (/ws) open across Caddy config reloads (default: closed on every reload)
+	reverse_proxy mikeos-meetings:8095 {
+		stream_close_delay 12h
+	}
 }
 BLK
   echo "   appended meetings.osmike.com"

@@ -27,6 +27,13 @@ services:
       LLM_URL: https://gpu.osmike.com
       LLM_MODEL: huihui_ai/qwen3-abliterated:8b-v2
       GPU_OSMIKE_TOKEN: ${GPU_OSMIKE_TOKEN}
+      # Media path for new rooms: sfu = LiveKit on relay 114 (livekit.osmike.com, no participant ceiling), mesh = the
+      # old peer-to-peer path. Way back: MEETINGS_MEDIA=mesh in .env, then `docker compose --env-file .env up -d mikeos-meetings`.
+      # Per room for tests: /r/<room>?media=mesh|sfu (the first person decides; everyone in a room uses the same path).
+      MEETINGS_MEDIA: ${MEETINGS_MEDIA:-sfu}
+      LIVEKIT_URL: ${LIVEKIT_URL}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
     volumes:
       - /data/meetings:/data          # RAID6 (recordings, transcripts, sessions) — never the NVMe root
     networks: [deploy_default]

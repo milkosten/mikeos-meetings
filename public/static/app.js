@@ -183,8 +183,20 @@
   }
 
   // ===================== join screen + call =====================
+  // The SFU client (LiveKit, Apache-2.0, vendored and pinned) loads only for rooms that use the SFU.
+  const LK_SRC = '/static/vendor/livekit-client-2.23.0.umd.js';
+  let lkLoading = null;
+  const loadLK = () => lkLoading || (lkLoading = new Promise((res, rej) => {
+    if (window.LivekitClient) return res(window.LivekitClient);
+    const s = document.createElement('script'); s.src = LK_SRC; s.async = true;
+    s.onload = () => (window.LivekitClient ? res(window.LivekitClient) : rej(new Error('no LivekitClient')));
+    s.onerror = () => { lkLoading = null; rej(new Error('load failed')); }; document.head.appendChild(s); }));
+  const ROOM_Q = new URLSearchParams(location.search);
+  const WANT_MEDIA = ['mesh', 'sfu'].includes(ROOM_Q.get('media')) ? ROOM_Q.get('media') : null;   // test only: ?media=mesh|sfu
+
   async function renderJoin(roomId, err) {
     const info = await api('/api/room/' + encodeURIComponent(roomId));
+    if ((WANT_MEDIA || info.media) === 'sfu') loadLK().catch(() => {});
     let saved = ''; try { saved = localStorage.getItem('osmike-meetings-name') || ''; } catch { /* */ }
     shell(`<section class="card auth join">
       <p class="eyebrow">Join meeting</p><h1>${esc(info.title || 'Meeting')}</h1>
@@ -207,11 +219,11 @@
         if (!name) { renderJoin(roomId, 'Type your name to join.'); return; }
         try { localStorage.setItem('osmike-meetings-name', name); } catch { /* */ }
       }
-      renderRoom(roomId, name);
+      renderRoom(roomId, name, (WANT_MEDIA || info.media) === 'sfu');
     };
   }
 
-  async function renderRoom(roomId, guestName) {
+  async function renderRoom(roomId, guestName, sfuLikely) {
     app.innerHTML = `${ICONS}<div class="room">
       <div class="roomtop"><a class="brand light" href="/" aria-label="Meetings home"><span class="mark" aria-hidden="true"></span></a>
         <span class="rec" title="This meeting is recorded and transcribed">${icon('rec')}Recorded</span>
@@ -227,7 +239,7 @@
       </div></div>`;
     const copy = () => { navigator.clipboard?.writeText(location.origin + '/r/' + roomId); showToast('Link copied'); };
     $('#copy').onclick = copy; $('#copy2').onclick = copy;
-    let localStream, iceServers = [], ws, rec = null, meetingId = null, ended = false;
+    let localStream, iceServers = [], ws, rec = null, meetingId = null, ended = false, mode = 'mesh', lkRoom = null;
     const pcs = new Map();
     const grid = $('#grid'), cnt = $('#cnt');
     const myName = me.authenticated ? me.user.name : guestName;
@@ -241,7 +253,8 @@
       if (muted !== undefined) t.classList.toggle('ismuted', muted);
       return t;
     }
-    const updCnt = () => { cnt.textContent = (pcs.size + 1) + ' in call'; layout(); };
+    const others = () => (mode === 'sfu' ? (lkRoom ? lkRoom.remoteParticipants.size : 0) : pcs.size);
+    const updCnt = () => { cnt.textContent = (others() + 1) + ' in call'; layout(); };
     function layout() {
       const self = grid.querySelector('.tile.self'), others = [...grid.querySelectorAll('.tile:not(.self)')], wait = $('#waiting');
       if (self) { self.classList.toggle('solo', !others.length); self.classList.toggle('pip', others.length > 0); }
@@ -258,7 +271,9 @@
     // ~640x360 at 24 fps: every browser sends its camera to every other one (mesh), so a small picture keeps 6–10
     // people smooth. "ideal" lets phones (iPhone Safari) pick their nearest mode; the second try is the plain camera.
     const AUDIO = { echoCancellation: true, noiseSuppression: true };
-    const VIDEO = { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' };
+    // SFU: one upload per browser, so the camera can be 960x540 (simulcast sends 180p/360p/540p, each viewer gets what fits).
+    const VIDEO = sfuLikely ? { width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' }
+      : { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' };
     try { localStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO, video: VIDEO }); }
     catch { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO, video: true }); } catch { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); showToast('No camera — joining with sound only'); }
       catch { localStream = new MediaStream(); showToast('Camera and microphone are blocked — check the browser permissions'); } } }
@@ -329,7 +344,8 @@
     }
     const dbg = [];   // last connection events, for diagnostics (window.osmikeMeeting.log)
     const note = (id, e) => { dbg.push([new Date().toISOString().slice(11, 23), String(id).slice(0, 5), e]); if (dbg.length > 400) dbg.shift(); };
-    const FORCE_RELAY = new URLSearchParams(location.search).get('relay') === '1'; // test only: TURN path
+    const FORCE_RELAY = ROOM_Q.get('relay') === '1' || ROOM_Q.get('tcp') === '1'; // test only: TURN path (tcp=1: TURN over TCP only)
+    const turnList = () => (ROOM_Q.get('tcp') === '1' ? iceServers.filter((x) => String(x.urls).includes('transport=tcp')) : iceServers);
     function makePC(peerId, name, initiator) {
       const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all' });
       pc._initiator = initiator;
@@ -359,7 +375,7 @@
           const moving = f > (pc._frames ?? -1) || a > (pc._audio ?? -1);
           pc._frames = f; pc._audio = a;
           if (moving) pc._still = 0; else if (++pc._still >= 3) { pc._still = 0; heal(id, 'frozen'); } }).catch(() => {}); }); }, 3500);
-    window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg };   // for diagnostics and the load test
+    window.osmikeMeeting = { pcs, tier: () => videoTier(pcs.size), heal, log: dbg, mode: () => mode, room: () => lkRoom, stats: () => sfuStats(), dropSocket: () => ws && ws.close() };   // diagnostics + load tests
     async function onSignal(from, name, data) {
       let pc = pcs.get(from);
       if (data.restart) { if (pc && pc._initiator && !pc._healing) heal(from, 'asked'); return; }
@@ -370,7 +386,98 @@
       } else if (data.candidate && pc) { try { await pc.addIceCandidate(data.candidate); } catch { /* */ } }
     }
     function dropPeer(id, why) { note(id, 'drop:' + (why || 'left')); const pc = pcs.get(id); if (pc) { pcs.delete(id); pc.close(); } grid.querySelector(`[data-p="${id}"]`)?.remove(); updCnt(); retune(); }
-    function cleanup() { pcs.forEach((pc) => pc.close()); localStream.getTracks().forEach((t) => t.stop()); }
+    function cleanup() { pcs.forEach((pc) => pc.close()); if (lkRoom) { const r = lkRoom; lkRoom = null; r.disconnect().catch(() => {}); } localStream.getTracks().forEach((t) => t.stop()); }
+
+    // ---------- SFU (LiveKit): one upload per browser (simulcast 180p/360p/540p), the server forwards it to everyone.
+    // The /ws socket above stays the authority for who is in the meeting, recording and the end of the meeting.
+    let lkTries = 0;
+    const tileEl = (id) => grid.querySelector(`[data-p="${CSS.escape(id)}"]`);
+    function speakSound(blocked) {
+      let b = $('#sound');
+      if (!blocked) { if (b) b.remove(); return; }
+      if (b) return;
+      b = document.createElement('button'); b.id = 'sound'; b.type = 'button'; b.className = 'btn primary soundbtn'; b.textContent = 'Tap to turn on sound';
+      b.onclick = () => lkRoom && lkRoom.startAudio().then(() => speakSound(!lkRoom.canPlaybackAudio)).catch(() => {});
+      $('.room').appendChild(b);
+    }
+    async function startSfu(info) {
+      mode = 'sfu';
+      let LK; try { LK = await loadLK(); } catch { cnt.textContent = 'video could not load — reload to rejoin'; return; }
+      const { Room, RoomEvent, Track, VideoPresets } = LK;
+      const flags = (p) => { const t = tileEl(p.identity); if (!t) return;
+        const mic = p.getTrackPublication(Track.Source.Microphone), cam = p.getTrackPublication(Track.Source.Camera);
+        t.classList.toggle('ismuted', !mic || mic.isMuted); t.classList.toggle('camoff', !cam || cam.isMuted || !cam.track); };
+      const tileOf = (p) => { const t = tile(p.identity, p.name || 'Guest'); return t; };
+      const room = new Room({ adaptiveStream: true, dynacast: true, disconnectOnPageLeave: true,
+        publishDefaults: { simulcast: true, videoCodec: 'vp8', videoEncoding: { maxBitrate: 1_000_000, maxFramerate: 24 },
+          videoSimulcastLayers: [VideoPresets.h180, VideoPresets.h360], dtx: true, red: true } });
+      lkRoom = room;
+      room.on(RoomEvent.ParticipantConnected, (p) => { tileOf(p); flags(p); updCnt(); note(p.identity, 'joined'); })
+        .on(RoomEvent.ParticipantDisconnected, (p) => { tileEl(p.identity)?.remove(); updCnt(); note(p.identity, 'left'); })
+        .on(RoomEvent.TrackSubscribed, (track, pub, p) => { const t = tileOf(p);
+          if (track.kind === 'video') track.attach(t.querySelector('video'));
+          else if (track.kind === 'audio') { const a = track.attach(); a.className = 'lkaudio'; t.appendChild(a); }
+          flags(p); updCnt(); })
+        .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => { track.detach().forEach((el) => { if (el.tagName === 'AUDIO') el.remove(); }); flags(p); })
+        .on(RoomEvent.TrackMuted, (pub, p) => { if (!p.isLocal) flags(p); })
+        .on(RoomEvent.TrackUnmuted, (pub, p) => { if (!p.isLocal) flags(p); })
+        .on(RoomEvent.TrackPublished, (pub, p) => flags(p))
+        .on(RoomEvent.TrackUnpublished, (pub, p) => flags(p))
+        .on(RoomEvent.ActiveSpeakersChanged, (sp) => { const ids = new Set(sp.map((x) => (x.isLocal ? 'self' : x.identity)));
+          grid.querySelectorAll('.tile').forEach((t) => t.classList.toggle('speaking', ids.has(t.dataset.p))); })
+        .on(RoomEvent.AudioPlaybackStatusChanged, () => speakSound(!room.canPlaybackAudio))
+        .on(RoomEvent.Reconnecting, () => { cnt.textContent = 'reconnecting…'; note('lk', 'reconnecting'); })
+        .on(RoomEvent.Reconnected, () => { updCnt(); note('lk', 'reconnected'); })
+        .on(RoomEvent.Disconnected, (why) => { note('lk', 'disconnected:' + why); if (lkRoom === room) lkLost(); });
+      try {
+        await room.connect(info.url, info.token, { autoSubscribe: true, rtcConfig: { iceServers: turnList(), iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all' } });
+      } catch (e) { note('lk', 'connect failed: ' + (e && e.message)); if (lkRoom === room) lkLost(); return; }
+      if (lkRoom !== room || ended) { room.disconnect(); return; }
+      lkTries = 0; note('lk', 'connected');
+      room.remoteParticipants.forEach((p) => { tileOf(p); flags(p); });
+      for (const t of localStream.getTracks()) {
+        try { const pub = await room.localParticipant.publishTrack(t, { source: t.kind === 'audio' ? Track.Source.Microphone : Track.Source.Camera,
+          name: t.kind === 'audio' ? 'microphone' : 'camera' });
+          if ((t.kind === 'audio' && !micOn) || (t.kind === 'video' && !camOn)) await pub.mute();
+        } catch (e) { note('lk', 'publish ' + t.kind + ' failed: ' + e.message); }
+      }
+      speakSound(!room.canPlaybackAudio); updCnt();
+    }
+    function lkLost() {      // the SFU connection is gone for good (LiveKit's own resume gave up): new token, new connection
+      lkRoom = null; grid.querySelectorAll('.tile:not(.self)').forEach((t) => t.remove()); updCnt();
+      if (ended) return;
+      if (lkTries++ < 5) { cnt.textContent = 'reconnecting…'; setTimeout(() => { if (!ended) wsSend({ type: 'media-token' }); }, 1500 * lkTries); }
+      else cnt.textContent = 'video disconnected — reload to rejoin';
+    }
+    function sfuMute(kind, on) {
+      if (mode !== 'sfu' || !lkRoom || !window.LivekitClient) return false;
+      const S = window.LivekitClient.Track.Source;
+      const pub = lkRoom.localParticipant.getTrackPublication(kind === 'audio' ? S.Microphone : S.Camera);
+      if (pub && pub.track) { (on ? pub.unmute() : pub.mute()).catch(() => {}); }
+      return true;
+    }
+    async function sfuStats() {          // diagnostics + the load test (scripts/load_sfu.py)
+      const r = lkRoom, LKc = window.LivekitClient; if (!r || !LKc) return { mode, connected: false };
+      const S = LKc.Track.Source, out = { mode, state: r.state, peers: r.remoteParticipants.size, tiles: document.querySelectorAll('.tile:not(.self) video').length, remotes: [], up: { layers: [], audio: 0 } };
+      const pairOf = (st) => { let pair = null; st.forEach((x) => { if (x.type === 'transport' && x.selectedCandidatePairId) pair = st.get(x.selectedCandidatePairId); });
+        if (!pair) st.forEach((x) => { if (x.type === 'candidate-pair' && x.nominated && x.state === 'succeeded') pair = x; });
+        return pair ? { lt: st.get(pair.localCandidateId)?.candidateType, proto: st.get(pair.localCandidateId)?.protocol, relayProto: st.get(pair.localCandidateId)?.relayProtocol, rtt: pair.currentRoundTripTime } : null; };
+      for (const p of r.remoteParticipants.values()) {
+        const pub = p.getTrackPublication(S.Camera), o = { id: p.identity, name: p.name, frames: 0, w: 0, h: 0, fps: 0, inBytes: 0, quality: pub ? pub.videoQuality : null };
+        if (pub && pub.track && pub.track.getRTCStatsReport) {
+          const st = await pub.track.getRTCStatsReport().catch(() => null);
+          if (st) { st.forEach((x) => { if (x.type === 'inbound-rtp' && x.kind === 'video') { o.frames = x.framesDecoded || 0; o.w = x.frameWidth || 0; o.h = x.frameHeight || 0; o.fps = x.framesPerSecond || 0; o.inBytes = x.bytesReceived || 0; } });
+            if (!out.down) out.down = pairOf(st); }
+        }
+        out.remotes.push(o);
+      }
+      const v = r.localParticipant.getTrackPublication(S.Camera), a = r.localParticipant.getTrackPublication(S.Microphone);
+      if (v && v.track && v.track.getRTCStatsReport) { const st = await v.track.getRTCStatsReport().catch(() => null);
+        if (st) { st.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'video') out.up.layers.push({ rid: x.rid || '', w: x.frameWidth || 0, h: x.frameHeight || 0, fps: x.framesPerSecond || 0, bytes: x.bytesSent || 0, active: x.active, limit: x.qualityLimitationReason }); });
+          out.upPath = pairOf(st); } }
+      if (a && a.track && a.track.getRTCStatsReport) { const st = await a.track.getRTCStatsReport().catch(() => null); if (st) st.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'audio') out.up.audio = x.bytesSent || 0; }); }
+      return out;
+    }
     function endedScreen(by) {
       ended = true; cleanup();
       shell(`<section class="card auth"><p class="eyebrow">Meeting ended</p><h1>${by ? esc(by.charAt(0).toUpperCase() + by.slice(1)) : 'The meeting has ended'}</h1>
@@ -379,23 +486,49 @@
         <a class="btn secondary" href="/r/${esc(roomId)}">Rejoin</a></section>`);
     }
 
+    // The meeting socket. If it drops without a Leave (network blip, a proxy reload) it reconnects and resumes the same
+    // place for ~30 s (same peer id, same SFU identity); the pictures keep running meanwhile. Recording restarts.
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => wsSend({ type: 'join', room: roomId, name: myName });
-    ws.onclose = () => { if (!ended) { cnt.textContent = 'disconnected — reload to rejoin'; } };
-    ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === 'welcome') { meetingId = m.meeting; if (m.is_host) $('#endall').hidden = false; (m.peers || []).forEach((p) => makePC(p.id, p.name, true)); startRecording(); }
-      else if (m.type === 'signal') onSignal(m.from, m.name, m.data);
-      else if (m.type === 'peer-left') dropPeer(m.id);
+    let resumeKey = null, selfId = null, wsTries = 0, joined = false;
+    function connectWs() {
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => wsSend(resumeKey ? { type: 'join', room: roomId, name: myName, resume: resumeKey, pid: selfId }
+        : { type: 'join', room: roomId, name: myName, ...(WANT_MEDIA ? { media: WANT_MEDIA } : {}) });
+      ws.onclose = () => {
+        if (ended) return;
+        if (!joined || !resumeKey || wsTries >= 7) { cnt.textContent = 'disconnected — reload to rejoin'; return; }
+        if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch { /* */ } }
+        cnt.textContent = 'reconnecting…'; note('ws', 'closed, retry ' + (wsTries + 1));
+        setTimeout(() => { if (!ended) connectWs(); }, [500, 1000, 2000, 3000, 4000, 5000, 5000][wsTries++]);
+      };
+      ws.onmessage = onWsMessage;
+    }
+    function onWsMessage(ev) { let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === 'welcome') {
+        meetingId = m.meeting; resumeKey = m.resume || null; selfId = m.self; wsTries = 0; if (m.is_host) $('#endall').hidden = false;
+        if (m.resumed) {       // back in the same place: keep the pictures, restart the recording
+          note('ws', 'resumed'); startRecording(); updCnt();
+          if (mode === 'sfu') { if (!lkRoom && m.sfu) startSfu(m.sfu); }
+          else (m.peers || []).forEach((p) => { if (!pcs.has(p.id)) makePC(p.id, p.name, true); });
+          return;
+        }
+        joined = true;
+        if (m.media === 'sfu' && m.sfu) startSfu(m.sfu); else (m.peers || []).forEach((p) => makePC(p.id, p.name, true));
+        startRecording(); }
+      else if (m.type === 'resume-failed') { ended = true; cleanup(); location.reload(); }
+      else if (m.type === 'media-token') { if (mode === 'sfu' && !ended) startSfu({ url: m.url, token: m.token }); }
+      else if (m.type === 'signal') { if (mode === 'mesh') onSignal(m.from, m.name, m.data); }
+      else if (m.type === 'peer-left') { if (mode === 'mesh') dropPeer(m.id); else { tileEl(m.id)?.remove(); updCnt(); } }
       else if (m.type === 'ended') { stopRecording(); endedScreen(m.by && m.by.startsWith('ended by') ? `ended by ${m.by.slice(9)}` : ''); }
       else if (m.type === 'error' && m.error === 'name_required') { ended = true; cleanup(); renderJoin(roomId, 'Type your name to join.'); }
       else if (m.type === 'error' && m.error === 'only_the_host_can_end') showToast('Only the host can end the meeting for everyone');
-    };
+    }
+    connectWs();
 
     let micOn = true, camOn = true;
-    $('#mic').onclick = () => { micOn = !micOn; localStream.getAudioTracks().forEach((t) => { t.enabled = micOn; }); $('#mic').classList.toggle('off', !micOn); $('#mic').setAttribute('aria-pressed', String(!micOn)); $('#mic').textContent = micOn ? '🎙️' : '🔇'; tile('self', undefined, !micOn); };
-    $('#cam').onclick = () => { camOn = !camOn; localStream.getVideoTracks().forEach((t) => { t.enabled = camOn; }); $('#cam').classList.toggle('off', !camOn); $('#cam').setAttribute('aria-pressed', String(!camOn)); $('#cam').textContent = camOn ? '🎥' : '🚫'; };
+    $('#mic').onclick = () => { micOn = !micOn; if (!sfuMute('audio', micOn)) localStream.getAudioTracks().forEach((t) => { t.enabled = micOn; }); $('#mic').classList.toggle('off', !micOn); $('#mic').setAttribute('aria-pressed', String(!micOn)); $('#mic').textContent = micOn ? '🎙️' : '🔇'; tile('self', undefined, !micOn); };
+    $('#cam').onclick = () => { camOn = !camOn; if (!sfuMute('video', camOn)) localStream.getVideoTracks().forEach((t) => { t.enabled = camOn; }); $('#cam').classList.toggle('off', !camOn); $('#cam').setAttribute('aria-pressed', String(!camOn)); $('#cam').textContent = camOn ? '🎥' : '🚫'; };
     $('#leave').onclick = async () => { await stopRecording(); wsSend({ type: 'leave' }); try { ws.close(); } catch { /* */ } ended = true; cleanup();
       if (me.authenticated && meetingId) endedScreen('you left the meeting'); else location.href = '/'; };
     $('#endall').onclick = async () => { if (!confirm('End the meeting for everyone? The recording is then transcribed.')) return; await stopRecording(); wsSend({ type: 'end-meeting' }); };

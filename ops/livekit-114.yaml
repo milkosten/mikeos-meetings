@@ -1,0 +1,27 @@
+# LiveKit SFU for meetings.osmike.com — relay 114 (/opt/osmike-livekit/livekit.yaml). Keys come from LIVEKIT_KEYS in
+# /opt/osmike-livekit/.env (never in this file). Signaling: wss://livekit.osmike.com -> 114 Caddy -> 172.17.0.1:7880.
+# Media: one UDP port (7882, all participants multiplexed) + TCP 7881 as fallback. No overlap with coturn
+# (osmike-turn: 3478 + relay ports 49152-65535). Strict networks also get our coturn as TURN (the meetings server hands
+# the browser its /api/ice list).
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+  - 172.17.0.1
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  node_ip: 144.76.45.114
+  allow_tcp_fallback: true
+  interfaces:
+    includes: [enp41s0]   # only the public NIC (not the docker bridges)
+turn:
+  enabled: false
+room:
+  auto_create: true
+  empty_timeout: 300
+  departure_timeout: 20
+  max_participants: 0          # no ceiling
+logging:
+  level: info
+  json: false

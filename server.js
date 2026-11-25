@@ -56,6 +56,20 @@ export function createApp(env = process.env, deps = {}) {
   const callback = () => `https://${cfg.PUBLIC_HOST}/auth/callback`;
   const safeNext = (v) => (typeof v === 'string' && v.startsWith('/') && !v.startsWith('//') && !v.includes('\\') && !v.startsWith('/auth/') && v.length < 1000 && !/[\x00-\x1f]/.test(v)) ? v : '/';
 
+  // ================= silent single sign-on (OIDC prompt=none) =================
+  // Signed in at another OsMike site -> signed in here without a click. A real browser page view with no
+  // session asks the account once per 10 min (sso_tried); no account session -> error=login_required ->
+  // the same page, signed out (guests join as before). sso_off = signed out here, stays out until Sign in.
+  const SSO_TRIED = 'sso_tried', SSO_OFF = 'sso_off', SSO_SILENT = ['login_required', 'interaction_required', 'consent_required', 'account_selection_required'];
+  const SSO_SKIP = /^\/(auth|api|static|healthz|ws|favicon|robots\.txt|\.well-known)(\/|$|\.)/;
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.get('sec-fetch-mode') !== 'navigate' || (req.get('sec-fetch-dest') || 'document') !== 'document') return next();
+    if (/prefetch/i.test((req.get('sec-purpose') || '') + (req.get('purpose') || '')) || !(req.get('accept') || '').includes('text/html')) return next();
+    if (req.cookies?.[SSO_TRIED] || req.cookies?.[SSO_OFF] || req.query.sso === '0' || SSO_SKIP.test(req.path) || sessionOf(req)) return next();
+    res.cookie(SSO_TRIED, '1', { ...cookieOpts, maxAge: 600_000 });
+    res.set('Cache-Control', 'no-store').redirect(302, `/auth/login?prompt=none&next=${encodeURIComponent(req.originalUrl)}`);
+  });
+
   // ================= login (state bound to the browser that started it, single use, 10 min) =================
   const flows = new Map(); // digest(state) -> { pre: digest(pre-cookie), verifier, next, exp }
   app.get('/auth/login', (req, res) => {
@@ -69,6 +83,7 @@ export function createApp(env = process.env, deps = {}) {
     const u = new URL(`${cfg.ISSUER}/oauth/authorize`);
     for (const [k, v] of Object.entries({ response_type: 'code', client_id: cfg.CLIENT_ID, redirect_uri: callback(), scope: 'openid profile email',
       state, code_challenge: b64url(crypto.createHash('sha256').update(verifier).digest()), code_challenge_method: 'S256' })) u.searchParams.set(k, v);
+    if (req.query.prompt === 'none') u.searchParams.set('prompt', 'none');
     res.redirect(u.toString());
   });
 
@@ -78,6 +93,11 @@ export function createApp(env = process.env, deps = {}) {
     const { code, state, error } = req.query;
     const f = flows.get(digest(String(state || '')));
     const pre = req.cookies?.[PRE];
+    if (SSO_SILENT.includes(String(error || ''))) { // prompt=none, no account session: back to the page, signed out
+      if (f) flows.delete(digest(String(state)));
+      const to = (f && f.next) || '/';
+      return res.redirect(303, req.cookies?.[SSO_TRIED] ? to : to + (to.includes('?') ? '&' : '?') + 'sso=0');
+    }
     if (!f || f.exp < Date.now() || !pre || !crypto.timingSafeEqual(Buffer.from(f.pre), Buffer.from(digest(pre)))) {
       return page('Sign in again', '<p>This sign-in link has expired or was started in another browser.</p><p><a class="btn primary" href="/auth/login">Sign in</a></p>', 400)(res);
     }
@@ -98,7 +118,7 @@ export function createApp(env = process.env, deps = {}) {
       store.putSession(sid, { user: { sub: String(info.sub), email: String(info.email).toLowerCase(), name: String(info.name || info.preferred_username || info.email).slice(0, 120) },
         csrf: b64url(crypto.randomBytes(18)), access_token: tok.access_token, refresh_token: tok.refresh_token || null,
         token_expires: now + (+tok.expires_in || 3600) * 1000, created: now, expires: now + 30 * 86400_000 });
-      res.clearCookie(PRE, cookieOpts);
+      res.clearCookie(PRE, cookieOpts); res.clearCookie(SSO_OFF, cookieOpts); res.clearCookie(SSO_TRIED, cookieOpts);
       res.cookie(SID, sid, { ...cookieOpts, maxAge: 30 * 86400_000 });
       res.redirect(f.next || '/');
     } catch (e) {
@@ -111,7 +131,8 @@ export function createApp(env = process.env, deps = {}) {
   app.post('/auth/logout', (req, res) => {
     const s = sessionOf(req);
     if (s && !csrfOk(req, s)) return res.status(403).json({ error: 'csrf' });
-    store.dropSession(sidOf(req)); res.clearCookie(SID, cookieOpts); res.json({ ok: true });
+    store.dropSession(sidOf(req)); res.clearCookie(SID, cookieOpts);
+    res.cookie(SSO_OFF, '1', { ...cookieOpts, maxAge: 180 * 86400_000 }); res.json({ ok: true });
   });
 
   app.get('/api/me', (req, res) => {

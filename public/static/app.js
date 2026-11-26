@@ -532,7 +532,7 @@
       rec: () => ({ state: R.state, why: R.why, seg: R.seg, restarts: R.restarts, queued: R.out.length, lastChunkAgo: Date.now() - R.lastChunk, track: R.track && R.track.id, recorder: R.rec && R.rec.state, log: R.log.slice(-15) }),
       endMic: () => { const t = micTrack(); if (t) { t.stop(); t.dispatchEvent(new Event('ended')); } return !!t; },   // a microphone that goes away
       swapMic: () => reacquireMic('test swap').then((t) => !!t),
-      share: () => ({ me: SH.me ? { kind: SH.me.kind, audio: !!SH.me.a, smooth: SH.me.smooth } : null, screens: [...SH.screens.values()].map((x) => ({ id: x.id, name: x.name, kind: x.kind })), sel: SH.sel,
+      share: () => ({ me: SH.me ? { kind: SH.me.kind, audio: !!SH.me.a, smooth: SH.me.smooth } : null, screens: [...SH.screens.values()].filter((x) => !x.mine).map((x) => ({ id: x.id, name: x.name, kind: x.kind })), mine: SH.screens.has('__me'), sel: SH.sel,
         layout: $('.room') ? $('.room').classList.contains('sharing') : false, pill: ($('#shpill') || {}).textContent || '', bar: $('#sharebar') ? !$('#sharebar').hidden : false }),
       endShare: () => { if (!SH.me) return false; const t = SH.me.v; t.stop(); t.dispatchEvent(new Event('ended')); return true; },   // = the browser's own Stop sharing                                                        // a switch of device
       killRecorder: () => { if (R.rec) { R.rec.ondataavailable = null; R.rec.onstop = null; try { R.rec.stop(); } catch { /* */ } } } };   // a recorder that dies silently
@@ -717,7 +717,7 @@
       } catch (e) { note('share', 'publish failed: ' + (e && e.message)); showToast('Could not share: ' + ((e && e.message) || 'error')); SH.starting = false; stopShare('publish failed', true); return; }
       SH.starting = false;
       if (!SH.me) return;                                 // stopped while it was starting
-      $('#sharepv').srcObject = new MediaStream([v]);     // a small preview only: never the share full size (mirror tunnel)
+      addMyScreen(v, kind);                               // Mike 2026-11-26: my own share on the stage too (the meeting tab itself is never offered, so no mirror tunnel)
       wsSend({ type: 'share', on: true, kind, audio: !!a });
       note('share', 'started ' + kind + (a ? ' + audio' : ''));
       shareButton();
@@ -726,7 +726,7 @@
       const s = SH.me; if (!s) return;
       SH.me = null;
       [s.v, s.a].forEach((t) => { if (t) try { t.stop(); } catch { /* */ } });
-      const pv = $('#sharepv'); if (pv) pv.srcObject = null;
+      removeScreen('__me');
       if (lkRoom) for (const t of [s.v, s.a]) { if (t) { try { await lkRoom.localParticipant.unpublishTrack(t, true); } catch { /* already gone */ } } }
       wsSend({ type: 'share', on: false, why: why || '' });
       note('share', 'stopped: ' + (why || ''));
@@ -766,6 +766,15 @@
       if (x.track !== track) { if (x.track) x.track.detach(x.el.querySelector('video')); x.track = track; track.attach(x.el.querySelector('video')); }
       renderScreens();
     }
+    function addMyScreen(v, kind) {
+      removeScreen('__me');
+      const el = document.createElement('div'); el.className = 'sh-item mine'; el.dataset.s = '__me';
+      el.innerHTML = '<video autoplay playsinline muted></video>';
+      $('#shview').appendChild(el);
+      el.querySelector('video').srcObject = new MediaStream([v]);
+      SH.screens.set('__me', { id: '__me', el, at: Date.now(), name: 'You', kind, mine: true });
+      SH.sel = '__me'; zoomable(el); renderScreens();
+    }
     function removeScreen(id) {
       const x = SH.screens.get(id); if (!x) return;
       if (x.track) { try { x.track.detach(x.el.querySelector('video')); } catch { /* */ } }
@@ -784,9 +793,9 @@
       const tabs = $('#shtabs');
       tabs.innerHTML = list.length > 1 ? list.map((x) => `<button type="button" role="tab" class="sh-tab" data-s="${esc(x.id)}" aria-selected="${x.id === SH.sel}">${esc(x.name)}</button>`).join('') : '';
       tabs.querySelectorAll('.sh-tab').forEach((b) => { b.onclick = () => { SH.sel = b.dataset.s; renderScreens(); }; });
-      $('#shpill').textContent = `${cur.name} is sharing ${KIND_WORD[cur.kind] || 'their screen'}`;
+      $('#shpill').textContent = cur.mine ? `You are sharing ${cur.kind === 'browser' ? 'a tab' : cur.kind === 'window' ? 'a window' : 'your screen'}` : `${cur.name} is sharing ${KIND_WORD[cur.kind] || 'their screen'}`;
       list.forEach((x) => { x.el.hidden = x.id !== SH.sel; });     // a hidden share is paused by the SFU (adaptive stream)
-      const st = $('#shstop'); st.hidden = !isHost;
+      const st = $('#shstop'); st.hidden = !isHost || !!cur.mine;
       st.onclick = () => { const t = SH.screens.get(SH.sel); if (!t) return;
         if (confirm(`Stop ${t.name}'s share for everyone?`)) wsSend({ type: 'stop-share', target: t.id }); };
       layout();

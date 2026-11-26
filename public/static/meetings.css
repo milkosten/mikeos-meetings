@@ -94,7 +94,7 @@ html[data-theme="dark"] { --site-ok:#7fd3a0; --site-rec:#ff6a4d; }
 .ctl.share.unavail { opacity:.45; }
 .body { flex:1; min-height:0; display:flex; flex-direction:column; }
 .sharebar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:6px 12px; background:var(--site-stage2); border-bottom:2px solid var(--site-ok); font-size:15px; }
-.sharebar video { width:96px; aspect-ratio:16/9; height:auto; border-radius:6px; background:var(--site-tile); object-fit:contain; flex:none; }
+.sharebar video { display:none; width:96px; aspect-ratio:16/9; height:auto; border-radius:6px; background:var(--site-tile); object-fit:contain; flex:none; }
 .sharebar .sb-t { font-weight:700; flex:1; min-width:120px; }
 .sharebar .smooth { display:inline-flex; align-items:center; gap:6px; font-size:14px; color:var(--site-stage-muted); cursor:pointer; min-height:36px; }
 .sharebar .smooth input { width:18px; height:18px; accent-color:var(--site-ok); margin:0; }

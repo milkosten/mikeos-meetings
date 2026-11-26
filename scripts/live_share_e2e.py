@@ -175,7 +175,9 @@ def main():
             check(pill == f"{n2} is sharing a tab", f"{who}: pill '{pill}'")
         dirn = ch.js("getComputedStyle(document.querySelector('#grid')).flexDirection")
         check(dirn == "column", f"desktop filmstrip is a column at the side ({dirn})")
-        check(not c2.share()["layout"] and not c2.share()["screens"], "the sharer does not see its own share full size (no mirror tunnel)")
+        check(wait(lambda: c2.share()["layout"] and c2.share().get("mine"), 15) and "You are sharing" in c2.share()["pill"], "the sharer sees its own share on the stage with the people on the right (Mike 2026-11-26)")
+        vw = c2.js("(()=>{const v=document.querySelector('.sh-item.mine video');const r=v&&v.getBoundingClientRect();return v?[v.videoWidth,Math.round(r.width),Math.round(r.height)]:null})()")
+        check(vw and vw[0] > 0 and vw[1] > 400, f"the sharer's own share is shown large (video {vw})")
         check(all(recording(c) for c in cs), "recording still on for all three while sharing")
         time.sleep(1.5)
         for dark in (False, True):

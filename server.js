@@ -367,6 +367,49 @@ export function createApp(env = process.env, deps = {}) {
     res.json(full(m, sub));
   });
 
+  // ================= the OsMike apps (2026-11-27) =================
+  // The native apps (no web views) sign in with the person's own OsMike account token. To join a meeting the app's own
+  // meeting client opens the same /ws socket as the browser; POST /api/app/session (Bearer = the person's token; an
+  // agent's token, which carries `act`, is refused) gives it a normal session to present as the session cookie, so the
+  // person joins signed in: host rights, their name on the transcript, the meeting in their previous meetings.
+  const claimsOf = (tok) => { try { return JSON.parse(Buffer.from(String(tok).split('.')[1] || '', 'base64url').toString()); } catch { return {}; } };
+  const personToken = (req) => { const h = req.get('authorization') || ''; const t = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+    return t && !claimsOf(t).act ? t : ''; };
+  async function personInfo(tok) {
+    const r = await fetchImpl(`${cfg.ISSUER}/oauth/userinfo`, { headers: { Authorization: `Bearer ${tok}`, Accept: 'application/json' } }).catch(() => null);
+    if (!r || !r.ok) return null;
+    const info = await r.json().catch(() => ({}));
+    return info.sub && info.email ? info : null;
+  }
+  const appSessions = new Map();   // sub -> [sid, …] (each app keeps at most 5 live sessions)
+  app.post('/api/app/session', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const tok = personToken(req);
+    if (!tok) return res.status(401).json({ error: 'person_token_required' });
+    const info = await personInfo(tok);
+    if (!info) return res.status(401).json({ error: 'bad_token' });
+    const sub = String(info.sub), sid = b64url(crypto.randomBytes(32)), now = Date.now();
+    const exp = Number(claimsOf(tok).exp) * 1000;
+    store.putSession(sid, { user: { sub, email: String(info.email).toLowerCase(), name: String(info.name || info.preferred_username || info.email).slice(0, 120) },
+      csrf: b64url(crypto.randomBytes(18)), access_token: tok, refresh_token: null,
+      token_expires: Number.isFinite(exp) && exp > now ? exp : now + 600_000, created: now, expires: now + 12 * 3600_000, via: 'app' });
+    const list = (appSessions.get(sub) || []).concat(sid);
+    while (list.length > 5) store.dropSession(list.shift());
+    appSessions.set(sub, list);
+    res.json({ cookie: SID, session: sid, expires_in: 12 * 3600, ws: `wss://${cfg.PUBLIC_HOST}/ws`, user: { name: store.getSession(sid).user.name } });
+  });
+  // Delete a previous meeting from the app: the host only (a person token, never an agent's).
+  app.delete('/api/app/meetings/:id', async (req, res) => {
+    const tok = personToken(req);
+    const info = tok && await personInfo(tok);
+    if (!info) return res.status(401).json({ error: 'person_token_required' });
+    const m = store.meeting(req.params.id);
+    if (!m || m.status === 'discarded' || !canSee(m, String(info.sub))) return res.status(404).json({ error: 'not_found' });
+    if (m.host_sub !== String(info.sub)) return res.status(403).json({ error: 'only_the_host_can_delete' });
+    if (m.status === 'live') return res.status(409).json({ error: 'still_running' });
+    store.deleteMeeting(m.id); res.json({ deleted: true });
+  });
+
   app.get('/healthz', (req, res) => res.json({ ok: true, queue: queue.length, busy: !!working, live: liveRooms.size,
     media: cfg.SFU_READY ? cfg.MEDIA : 'mesh', sfu: cfg.SFU_READY }));
 

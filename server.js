@@ -410,6 +410,18 @@ export function createApp(env = process.env, deps = {}) {
     store.deleteMeeting(m.id); res.json({ deleted: true });
   });
 
+  // Meeting links open the OsMike Meetings app when it is installed (2026-11-27, Mike's test: Join opened the browser).
+  // iOS universal links: Associated Domains applinks:meetings.osmike.com in com.osmike.meetings (team U8B998R2YD).
+  // Android App Links: com.osmike.meetings signed by Google Play (app-signing key) or by our upload key (internal installs).
+  const AASA = { applinks: { apps: [], details: [{ appIDs: ['U8B998R2YD.com.osmike.meetings'], appID: 'U8B998R2YD.com.osmike.meetings',
+    paths: ['/r/*'], components: [{ '/': '/r/*', comment: 'a meeting room' }] }] } };
+  const ASSETLINKS = [{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app',
+    package_name: 'com.osmike.meetings', sha256_cert_fingerprints: [
+      'F5:22:DC:1F:C8:62:2C:A2:83:F7:76:CC:CA:52:ED:7B:26:A3:18:B9:56:71:F7:7F:26:1D:FB:EE:B9:FB:6C:93',   // Play app signing
+      '78:35:B4:2E:ED:11:39:9B:17:8B:67:99:F6:B5:75:59:79:27:1E:C2:7A:9B:FA:26:F9:9E:39:B9:93:7A:EE:72'] } }];  // upload key
+  app.get('/.well-known/apple-app-site-association', (req, res) => { res.type('application/json'); res.send(JSON.stringify(AASA)); });
+  app.get('/.well-known/assetlinks.json', (req, res) => { res.type('application/json'); res.send(JSON.stringify(ASSETLINKS)); });
+
   app.get('/healthz', (req, res) => res.json({ ok: true, queue: queue.length, busy: !!working, live: liveRooms.size,
     media: cfg.SFU_READY ? cfg.MEDIA : 'mesh', sfu: cfg.SFU_READY }));
 

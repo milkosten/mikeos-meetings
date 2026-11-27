@@ -74,3 +74,17 @@ test('delete from the app: host only, person token only', async () => {
   assert.equal((await del(TOK_A)).status, 200);
   assert.equal((await del(TOK_A)).status, 404);
 });
+
+test('meeting links open the OsMike Meetings app: apple-app-site-association + assetlinks.json', async () => {
+  const a = await fetch(`${base}/.well-known/apple-app-site-association`, { redirect: 'manual' });
+  assert.equal(a.status, 200);
+  assert.match(a.headers.get('content-type'), /application\/json/);
+  const aj = await a.json();
+  assert.deepEqual(aj.applinks.details[0].appIDs, ['U8B998R2YD.com.osmike.meetings']);
+  assert.equal(aj.applinks.details[0].components[0]['/'], '/r/*');
+  const l = await fetch(`${base}/.well-known/assetlinks.json`, { redirect: 'manual' });
+  assert.equal(l.status, 200);
+  const lj = await l.json();
+  assert.equal(lj[0].target.package_name, 'com.osmike.meetings');
+  assert.equal(lj[0].target.sha256_cert_fingerprints.length, 2);
+});

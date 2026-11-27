@@ -88,3 +88,14 @@ test('meeting links open the OsMike Meetings app: apple-app-site-association + a
   assert.equal(lj[0].target.package_name, 'com.osmike.meetings');
   assert.equal(lj[0].target.sha256_cert_fingerprints.length, 2);
 });
+
+test('app rooms: a person makes a room (host), agents and bad tokens cannot', async () => {
+  const r = await fetch(`${base}/api/app/rooms`, { method: 'POST', headers: { Authorization: `Bearer ${TOK_A}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: 'Samtal med Bo' }) });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.match(j.room_id, /^[A-Za-z0-9]{6,64}$/);
+  assert.equal(j.join_url, `https://meet.test/r/${j.room_id}`);
+  assert.equal((await fetch(`${base}/api/app/rooms`, { method: 'POST', headers: { Authorization: `Bearer ${TOK_AGENT}` } })).status, 401);
+  assert.equal((await fetch(`${base}/api/app/rooms`, { method: 'POST' })).status, 401);
+});

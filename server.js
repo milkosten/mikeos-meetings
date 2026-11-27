@@ -398,6 +398,18 @@ export function createApp(env = process.env, deps = {}) {
     appSessions.set(sub, list);
     res.json({ cookie: SID, session: sid, expires_in: 12 * 3600, ws: `wss://${cfg.PUBLIC_HOST}/ws`, user: { name: store.getSession(sid).user.name } });
   });
+  // A new room for a call started from another OsMike app (OsMike Chat "Video call", 2026-11-27): the person is the
+  // host (person token only, never an agent's); the app sends the link to the chat and opens it in OsMike Meetings.
+  app.post('/api/app/rooms', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const tok = personToken(req);
+    const info = tok && await personInfo(tok);
+    if (!info) return res.status(401).json({ error: 'person_token_required' });
+    const roomId = newRoomId();
+    store.putRoom(roomId, { host_sub: String(info.sub), host_name: String(info.name || info.preferred_username || info.email).slice(0, 120),
+      created: Date.now(), title: String(req.body?.title || '').slice(0, 200) || null, via: 'app' });
+    res.json({ room_id: roomId, join_url: joinUrl(roomId) });
+  });
   // Delete a previous meeting from the app: the host only (a person token, never an agent's).
   app.delete('/api/app/meetings/:id', async (req, res) => {
     const tok = personToken(req);
